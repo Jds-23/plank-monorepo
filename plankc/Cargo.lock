@@ -3096,6 +3096,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "sir-release-backend"
+version = "0.1.0"
+dependencies = [
+ "plank-core",
+ "sir-assembler",
+]
+
+[[package]]
+name = "sir-stack-scheduling"
+version = "0.1.0"
+dependencies = [
+ "hashbrown 0.16.1",
+ "plank-core",
+ "plank-test-utils",
+ "pretty_assertions",
+ "sir-data",
+ "sir-parser",
+ "sir-passes",
+]
+
+[[package]]
+name = "sir-static-memory-allocator"
+version = "0.1.0"
+dependencies = [
+ "hashbrown 0.16.1",
+ "sir-data",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
