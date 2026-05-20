@@ -55,6 +55,10 @@ impl<'a> PassManager<'a> {
         }
     }
 
+    pub fn into_store(self) -> AnalysesStore {
+        self.store
+    }
+
     pub fn run_legalize(&mut self) -> Result<(), analyses::LegalizerError> {
         self.legalizer.get_or_insert_default().run(self.program, &self.store)
     }

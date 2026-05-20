@@ -185,6 +185,10 @@ impl AsmReference {
     pub fn new_delta(start: MarkId, end: MarkId) -> Self {
         Self { mark_ref: MarkReference::Delta(Span { start, end }), set_size: None, pushed: true }
     }
+
+    pub fn pushed(mark_ref: MarkReference) -> Self {
+        Self { mark_ref, set_size: None, pushed: true }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,7 +226,7 @@ impl Assembler {
     pub fn push_op_byte(&mut self, byte: u8) {
         match self.sections.last_mut() {
             Some(StoredAsmSection::Ops(bytes_span)) => {
-                debug_assert!(bytes_span.end == self.bytes.len_idx(), "span out of sync");
+                assert!(bytes_span.end == self.bytes.len_idx(), "span out of sync");
                 self.bytes.push(byte);
                 bytes_span.end = self.bytes.len_idx();
             }
@@ -235,47 +239,92 @@ impl Assembler {
         }
     }
 
+    #[track_caller]
+    pub fn push_swap(&mut self, depth: u8) {
+        let op = match depth {
+            0 => panic!("noop swap0"),
+            1 => op::SWAP1,
+            2 => op::SWAP2,
+            3 => op::SWAP3,
+            4 => op::SWAP4,
+            5 => op::SWAP5,
+            6 => op::SWAP6,
+            7 => op::SWAP7,
+            8 => op::SWAP8,
+            9 => op::SWAP9,
+            10 => op::SWAP10,
+            11 => op::SWAP11,
+            12 => op::SWAP12,
+            13 => op::SWAP13,
+            14 => op::SWAP14,
+            15 => op::SWAP15,
+            16 => op::SWAP16,
+            _ => panic!("unsupported swap with depth {depth}"),
+        };
+        self.push_op_byte(op);
+    }
+
+    #[track_caller]
+    pub fn push_dup(&mut self, depth: u8) {
+        let op = match depth {
+            0 => op::DUP1,
+            1 => op::DUP2,
+            2 => op::DUP3,
+            3 => op::DUP4,
+            4 => op::DUP5,
+            5 => op::DUP6,
+            6 => op::DUP7,
+            7 => op::DUP8,
+            8 => op::DUP9,
+            9 => op::DUP10,
+            10 => op::DUP11,
+            11 => op::DUP12,
+            12 => op::DUP13,
+            13 => op::DUP14,
+            14 => op::DUP15,
+            15 => op::DUP16,
+            _ => panic!("unsupported dup with depth {depth}"),
+        };
+        self.push_op_byte(op);
+    }
+
+    #[track_caller]
+    pub fn push_exchange(&mut self, n: u8, m: u8) {
+        assert!(n != m, "noop exchange");
+        match (n, m) {
+            (0, m) => self.push_swap(m),
+            (n, 0) => self.push_swap(n),
+            (n, m) => {
+                self.push_swap(n);
+                self.push_swap(m);
+                self.push_swap(n);
+            }
+        }
+    }
+
     pub fn push_minimal_u256(&mut self, value: U256) {
+        if value.is_zero() {
+            self.push_op_byte(op::PUSH0);
+            return;
+        }
+
         let push_size = 32 - value.leading_zeros() / 8;
-        debug_assert!(push_size <= u8::MAX as usize);
+        assert!(push_size <= u8::MAX as usize);
         let push_op = op::PUSH1 + push_size as u8 - 1;
-        debug_assert!(
-            (value == U256::ZERO) == (push_size == 0) && (push_size == 0) == (push_op == op::PUSH0),
-            "push0 handled incorrectly"
-        );
+        assert!((op::PUSH1..=op::PUSH32).contains(&push_op));
+
         self.push_op_byte(push_op);
-        let bytes = value.to_le_bytes::<32>();
-        for i in (0..push_size).rev() {
-            self.push_op_byte(bytes[i]);
+        for &byte in value.to_le_bytes::<32>()[..push_size].iter().rev() {
+            self.push_op_byte(byte);
         }
     }
 
     pub fn push_minimal_u64(&mut self, value: u64) {
-        let push_size = 8 - value.leading_zeros() as u8 / 8;
-        let push_op = op::PUSH1 + push_size - 1;
-        debug_assert!(
-            (value == 0) == (push_size == 0) && (push_size == 0) == (push_op == op::PUSH0),
-            "push0 handled incorrectly"
-        );
-        self.push_op_byte(push_op);
-        let bytes = value.to_le_bytes();
-        for i in (0..push_size).rev() {
-            self.push_op_byte(bytes[i as usize]);
-        }
+        self.push_minimal_u256(U256::from(value));
     }
 
     pub fn push_minimal_u32(&mut self, value: u32) {
-        let push_size = 4 - value.leading_zeros() as u8 / 8;
-        let push_op = op::PUSH1 + push_size - 1;
-        debug_assert!(
-            (value == 0) == (push_size == 0) && (push_size == 0) == (push_op == op::PUSH0),
-            "push0 handled incorrectly"
-        );
-        self.push_op_byte(push_op);
-        let bytes = value.to_le_bytes();
-        for i in (0..push_size).rev() {
-            self.push_op_byte(bytes[i as usize]);
-        }
+        self.push_minimal_u256(U256::from(value));
     }
 
     pub fn push_data(&mut self, data: &[u8]) {

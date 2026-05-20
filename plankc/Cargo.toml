@@ -11,6 +11,16 @@ license = "MIT"
 inherits = "release"
 debug-assertions = true
 
+[profile.profiling]
+inherits = "release"
+
+# Keep optimized code, but retain enough debug info for useful stacks.
+debug = true
+strip = false
+
+# Makes sampling stack traces much more reliable.
+incremental = false
+
 [workspace.dependencies]
 # Core
 plank-core = { path = "crates/plank-core" }
@@ -35,6 +45,9 @@ sir-passes = { path = "sir/crates/passes" }
 sir-parser = { path = "sir/crates/parser" }
 sir-assembler = { path = "sir/crates/assembler" }
 sir-debug-backend = { path = "sir/crates/debug-backend" }
+sir-release-backend = { path = "sir/crates/release-backend" }
+sir-stack-scheduling = { path = "sir/crates/stack-scheduling" }
+sir-static-memory-allocator = { path = "sir/crates/static-memory-allocator" }
 
 # Shared Dependencies
 bumpalo = { version = "3.19.0", features = ["allocator-api2", "collections"] }
