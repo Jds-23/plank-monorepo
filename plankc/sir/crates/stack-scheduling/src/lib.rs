@@ -1,18 +1,19 @@
-use plank_core::{DenseIndexMap, list_of_lists::ListOfLists};
-use sir_data::{BasicBlockId, EthIRProgram, newtype_index};
+use plank_core::{DenseIndexMap, list_of_lists::ListOfLists, newtype_index};
+use sir_data::{BasicBlockId, EthIRProgram};
 use sir_passes::{AnalysesStore, ControlFlowGraphInOutBundling};
 
 use layouts::{LayoutsTracker, build_basic_block_layout_sets};
 use op_graph::build_graph_simple;
 pub use stack::ScheduleConfig;
+pub mod op_graph;
 
 use crate::{scheduler::dumb_schedule, stack::StackOps};
 
 mod layouts;
-mod op_graph;
 mod op_model;
 mod scheduler;
 pub mod stack;
+mod state;
 
 newtype_index! {
     pub struct StackOpIdx;
