@@ -24,6 +24,14 @@ struct PreambleResult {
     is_comptime_only: bool,
 }
 
+impl PreambleResult {
+    fn suppress_poison_iff_diverging_return_type(
+        &self,
+    ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
+        if self.return_type == Ok(TypeId::NEVER) { Ok(Err(Diverge::END)) } else { Err(Poisoned) }
+    }
+}
+
 struct Call<'a> {
     source: SourceId,
     caller_comptime: bool,
@@ -391,13 +399,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         };
         let lowered = match lowered {
             Ok(lowered) => lowered,
-            Err(Poisoned) => {
-                return if preamble.return_type == Ok(TypeId::NEVER) {
-                    Ok(Err(Diverge::END))
-                } else {
-                    Err(Poisoned)
-                };
-            }
+            Err(Poisoned) => return preamble.suppress_poison_iff_diverging_return_type(),
         };
 
         let (mir_args, validity) = self.eval.mir_args.push_with_res(|mut pusher| {
@@ -425,7 +427,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             Ok(())
         });
         if let Err(Poisoned) = validity {
-            return Err(Poisoned);
+            return preamble.suppress_poison_iff_diverging_return_type();
         }
 
         let expr = mir::Expr::Call { callee: lowered, args: mir_args };
@@ -460,15 +462,9 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 State::Done(value) => {
                     return match value {
                         Ok(value) => Ok(Ok(EvalValue::Comptime(value))),
-                        Err(Poisoned) => {
-                            // Cache collapses `Diverge` into Err(Poisoned);
-                            // reconstruct the diverge when the return type was never.
-                            if preamble.return_type == Ok(TypeId::NEVER) {
-                                Ok(Err(Diverge::END))
-                            } else {
-                                Err(Poisoned)
-                            }
-                        }
+                        // Cache collapses `Diverge` into Err(Poisoned);
+                        // reconstruct the diverge when the return type was never.
+                        Err(Poisoned) => preamble.suppress_poison_iff_diverging_return_type(),
                     };
                 }
             },
