@@ -1,4 +1,4 @@
-use plank_core::DenseIndexMap;
+use plank_core::{DenseIndexMap, IndexVec};
 use plank_hir::{self as hir, ValueId};
 use plank_mir as mir;
 use plank_session::{MaybePoisoned, Poisoned, SourceId, SourceSpan, SrcLoc, poison};
@@ -10,7 +10,8 @@ use cache::*;
 pub(crate) use cache::{EvaluatedFunctionCache, LoweredFunctionsCache};
 
 use crate::{
-    evaluator::{CallArgSpansIdx, State},
+    evaluator::CallArgSpansIdx,
+    quota::{ComptimeQuota, QuotaExhaustedError},
     scope::{Diverge, EvalContext, EvalValue, Local, LocalState, Scope},
 };
 
@@ -25,9 +26,7 @@ struct PreambleResult {
 }
 
 impl PreambleResult {
-    fn suppress_poison_iff_diverging_return_type(
-        &self,
-    ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
+    fn suppress_poison_iff_diverging_return_type<T>(&self) -> MaybePoisoned<Result<T, Diverge>> {
         if self.return_type == Ok(TypeId::NEVER) { Ok(Err(Diverge::END)) } else { Err(Poisoned) }
     }
 }
@@ -36,6 +35,7 @@ struct Call<'a> {
     source: SourceId,
     caller_comptime: bool,
     caller_bindings: &'a DenseIndexMap<hir::LocalId, Local>,
+    caller_mir_types: &'a mut IndexVec<mir::LocalId, TypeId>,
     span: SourceSpan,
 
     closure: ValueId,
@@ -46,16 +46,6 @@ struct Call<'a> {
     validated: ArgParamComptimenessMatch,
 }
 
-fn comptime_args(
-    is_comptime: bool,
-    params: &[hir::ParamInfo],
-    args: &[hir::LocalId],
-) -> impl Iterator<Item = (hir::ParamInfo, hir::LocalId)> {
-    params.iter().zip(args).filter_map(move |(&param, &arg)| {
-        (param.is_comptime || is_comptime).then_some((param, arg))
-    })
-}
-
 impl Call<'_> {
     fn loc(&self) -> SrcLoc {
         SrcLoc::new(self.source, self.span)
@@ -63,27 +53,35 @@ impl Call<'_> {
 }
 
 impl<'a, 'ctx> Scope<'a, 'ctx> {
-    fn create_fn_scope<'s>(
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_new_fn_scope_for_preamble_eval<'s>(
         &'s mut self,
+        closure: ValueId,
         fn_def_id: hir::FnDefId,
-        args: &[hir::LocalId],
+        args: &'s [hir::LocalId],
         arg_spans: CallArgSpansIdx,
+        call_span: SourceSpan,
         capture_buf_offset: usize,
         validated: ArgParamComptimenessMatch,
-    ) -> (Scope<'s, 'ctx>, &'s DenseIndexMap<hir::LocalId, Local>) {
+    ) -> (Scope<'s, 'ctx>, Call<'s>, &'s mut ComptimeQuota, &'s mut u32) {
         let fn_def = self.eval.hir.fns[fn_def_id];
         let params = &self.eval.hir.fn_params[fn_def_id];
-        let is_comptime = self.is_comptime();
+        let caller_comptime = self.is_comptime();
+        let eval_branch_quota_start_loc = self.eval_branch_quota_start_loc;
+        let call_source = self.source;
+        let comptime_quota = self.comptime_quota;
         let caller_bindings = &mut self.bindings;
         let caller_mir_types = &mut self.mir_types;
-
-        let call_source = self.source;
+        let parent_comptime_quota = &mut self.comptime_quota;
+        let parent_max_eval_branch_quota_seen = &mut self.max_eval_branch_quota_seen;
 
         let mut fn_scope = Scope::new(
             self.eval,
             self.diag_ctx,
             fn_def.source,
             false,
+            comptime_quota,
+            eval_branch_quota_start_loc,
             EvalContext::FunctionPreamble { arg_spans, call_source },
         );
 
@@ -113,37 +111,28 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 }
             };
 
-            let state = if param.is_comptime {
-                let LocalState::Comptime(value) = state else {
-                    let ArgParamComptimenessMatch = validated;
-                    unreachable!("invariant: already validated");
-                };
-                Ok(LocalState::Comptime(value))
-            } else if is_comptime {
-                match state {
-                    LocalState::Runtime(_) => {
+            let state = 'state: {
+                if param.is_comptime || caller_comptime {
+                    let LocalState::Comptime(value) = state else {
                         let ArgParamComptimenessMatch = validated;
-                        Err(Poisoned)
-                    }
-                    LocalState::Comptime(value) => Ok(LocalState::Comptime(value)),
-                }
-            } else {
-                'state: {
-                    let ty = match state {
-                        LocalState::Runtime(outer_mir) => caller_mir_types[outer_mir],
-                        LocalState::Comptime(value) => {
-                            let ty = fn_scope.eval.values.type_of_value(value);
-                            // If value is comptime-only, even for a runtime call we treat it as a
-                            // comptime argument.
-                            if fn_scope.eval.types.is_comptime_only(ty) {
-                                break 'state Ok(LocalState::Comptime(value));
-                            }
-                            ty
-                        }
+                        unreachable!("invariant: already validated");
                     };
-                    let inner_mir = fn_scope.mir_types.push(ty);
-                    Ok(LocalState::Runtime(inner_mir))
+                    break 'state Ok(LocalState::Comptime(value));
                 }
+                let ty = match state {
+                    LocalState::Runtime(outer_mir) => caller_mir_types[outer_mir],
+                    LocalState::Comptime(value) => {
+                        let ty = fn_scope.eval.values.type_of_value(value);
+                        // If value is comptime-only, even for a runtime call we treat it as a
+                        // comptime argument.
+                        if fn_scope.eval.types.is_comptime_only(ty) {
+                            break 'state Ok(LocalState::Comptime(value));
+                        }
+                        ty
+                    }
+                };
+                let inner_mir = fn_scope.mir_types.push(ty);
+                Ok(LocalState::Runtime(inner_mir))
             };
             fn_scope.bindings.insert_no_prev(
                 param.value,
@@ -151,20 +140,41 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             );
         }
 
-        (fn_scope, caller_bindings)
+        let call = Call {
+            source: call_source,
+            caller_comptime,
+            caller_bindings,
+            caller_mir_types,
+            span: call_span,
+            closure,
+            func: fn_def,
+            args,
+            params,
+            validated,
+        };
+
+        (fn_scope, call, parent_comptime_quota, parent_max_eval_branch_quota_seen)
     }
 
-    fn eval_preamble(&mut self, fn_def_id: hir::FnDefId) -> MaybePoisoned<PreambleResult> {
+    fn eval_preamble(
+        &mut self,
+        fn_def_id: hir::FnDefId,
+    ) -> Result<MaybePoisoned<PreambleResult>, Diverge> {
         let fn_def = self.hir.fns[fn_def_id];
         match self.eval_comptime(fn_def.type_preamble) {
             Ok(()) => {}
-            Err(Diverge::ControlFlowPoisoned | Diverge::BlockEnd(_)) => return Err(Poisoned),
+            Err(Diverge::ComptimeQuotaExhausted) => {
+                return Err(Diverge::ComptimeQuotaExhausted);
+            }
+            Err(Diverge::ControlFlowPoisoned | Diverge::BlockEnd(_)) => {
+                return Ok(Err(Poisoned));
+            }
         }
         let return_type = self.expect_type(fn_def.return_type);
         let ret_type_loc = self.origin_loc(self.bindings[fn_def.return_type].origin);
         self.ctx = EvalContext::FunctionBody { ret_type: return_type, ret_type_loc };
         let is_comptime_only = return_type.is_ok_and(|ty| self.types.is_comptime_only(ty));
-        Ok(PreambleResult { return_type, is_comptime_only })
+        Ok(Ok(PreambleResult { return_type, is_comptime_only }))
     }
 
     pub(crate) fn eval_fn_def(&mut self, id: hir::FnDefId) -> MaybePoisoned<EvalValue> {
@@ -257,9 +267,11 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         args: &[hir::LocalId],
     ) -> MaybePoisoned<ArgParamComptimenessMatch> {
         let mut comptime_args_poisoned = false;
-        for (param, arg) in comptime_args(self.is_comptime(), params, args) {
+        for (param, &arg) in params.iter().zip(args) {
             let arg = self.bindings[arg];
-            if let Ok(LocalState::Runtime(_)) = arg.state {
+            if (param.is_comptime || self.is_comptime())
+                && let Ok(LocalState::Runtime(_)) = arg.state
+            {
                 self.diag_ctx
                     .emit_comptime_param_got_runtime(self.loc(arg.use_span), func.loc(param.span));
                 comptime_args_poisoned = true;
@@ -296,50 +308,61 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
 
         let validated = self.validate_args_param_comptimeness_match(func, params, args)?;
 
-        let (mut fn_scope, call) = {
-            let caller_comptime = self.is_comptime();
-            let call_source = self.source;
-            let (fn_scope, caller_bindings) =
-                self.create_fn_scope(fn_def_id, args, arg_spans, capture_buf_offset, validated);
-            let call = Call {
-                source: call_source,
-                caller_comptime,
-                caller_bindings,
-                span: call_span,
+        let (mut scope, call, parent_comptime_quota, parent_max_eval_branch_quota_seen) = self
+            .prepare_new_fn_scope_for_preamble_eval(
                 closure,
-                func,
+                fn_def_id,
                 args,
-                params,
+                arg_spans,
+                call_span,
+                capture_buf_offset,
                 validated,
-            };
-            (fn_scope, call)
-        };
+            );
+        let result = scope.eval_callee_scope(fn_def_id, call, values_buf_offset, call_loc);
 
+        *parent_comptime_quota = scope.comptime_quota;
+        *parent_max_eval_branch_quota_seen =
+            (*parent_max_eval_branch_quota_seen).max(scope.max_eval_branch_quota_seen);
+
+        result
+    }
+
+    fn eval_callee_scope(
+        &mut self,
+        fn_def_id: hir::FnDefId,
+        mut call: Call<'_>,
+        values_buf_offset: usize,
+        call_loc: SrcLoc,
+    ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
         let preamble = {
-            let restore = fn_scope.diag_ctx.set_preamble_call_site(call.loc());
-            let preamble = fn_scope.eval_preamble(fn_def_id);
-            fn_scope.diag_ctx.restore_preamble_call_site(restore);
-            preamble?
+            let restore = self.diag_ctx.set_preamble_call_site(call.loc());
+            let preamble = self.eval_preamble(fn_def_id);
+            self.diag_ctx.restore_preamble_call_site(restore);
+            match preamble {
+                Ok(Ok(preamble)) => preamble,
+                Ok(Err(Poisoned)) => return Err(Poisoned),
+                Err(diverge) => return Ok(Err(diverge)),
+            }
         };
 
         let mut runtime_param_count = 0;
 
         // Assemble comptime parameters for the function key.
-        for (&param, &arg) in params.iter().zip(args) {
-            let param_key_value = match fn_scope.bindings[param.value].state {
+        for (&param, &arg) in call.params.iter().zip(call.args) {
+            let param_key_value = match self.bindings[param.value].state {
                 Ok(LocalState::Comptime(value)) => Some(Ok(value)),
                 Err(Poisoned) => Some(Err(Poisoned)),
                 Ok(LocalState::Runtime(_)) => {
                     runtime_param_count += 1;
-                    // `create_fn_scope` optimistically makes params runtime in runtime contexts,
-                    // if we find out we need to evaluate as comptime we need to make sure all
-                    // arguments are added to the key.
+                    // `create_fn_scope_frame` optimistically makes params runtime in runtime
+                    // contexts, if we find out we need to evaluate as comptime
+                    // we need to make sure all arguments are added to the key.
                     match call.caller_bindings[arg].state {
                         Ok(LocalState::Comptime(value)) if preamble.is_comptime_only => {
                             Some(Ok(value))
                         }
                         _ => {
-                            let ArgParamComptimenessMatch = validated;
+                            let ArgParamComptimenessMatch = call.validated;
                             None
                         }
                     }
@@ -347,64 +370,104 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             };
 
             if let Some(value) = param_key_value {
-                fn_scope.eval.maybe_values_buf.push(value);
+                self.eval.maybe_values_buf.push(value);
             } else if let hir::ParamType::Any { capture } = param.r#type {
-                let capture_key_value = match fn_scope.bindings[capture].state {
+                let capture_key_value = match self.bindings[capture].state {
                     Ok(LocalState::Comptime(value)) => Ok(value),
                     Err(Poisoned) => Err(Poisoned),
                     Ok(LocalState::Runtime(_)) => {
                         unreachable!("any-type capture should be comptime")
                     }
                 };
-                fn_scope.eval.maybe_values_buf.push(capture_key_value);
+                self.eval.maybe_values_buf.push(capture_key_value);
             }
         }
 
         if call.caller_comptime || preamble.is_comptime_only {
-            return fn_scope.fold_comptime_call(&call, preamble, values_buf_offset);
+            let call_result = self.fold_comptime_call(&call, preamble, values_buf_offset);
+            return match call_result {
+                Ok(Ok(result)) => match result.outcome {
+                    ComptimeCallOutcome::Value(value) => Ok(Ok(EvalValue::Comptime(value))),
+                    ComptimeCallOutcome::DivergedEnd => Ok(Err(Diverge::END)),
+                },
+                Ok(Err(diverged)) => Ok(Err(diverged)),
+                Err(Poisoned) => Err(Poisoned),
+            };
         }
 
-        // --- Runtime path ---
-        // Non-comptime params are already bound as Runtime in `create_fn_scope`.
+        // Non-comptime params are already bound as Runtime in `create_fn_scope_frame`.
         let function =
-            FunctionKey::new(closure, &fn_scope.eval.maybe_values_buf[values_buf_offset..]);
+            FunctionKey::new(call.closure, &self.eval.maybe_values_buf[values_buf_offset..]);
 
-        let lowered = match fn_scope.eval.lowered_fns_cache.retrieve_or_create_entry(function) {
-            Ok(&mut State::Done(fn_id)) => fn_id,
-            Ok(state @ State::InProgress) => {
-                fn_scope.diag_ctx.emit_runtime_call_with_recursion(call_loc);
-                *state = State::Done(Err(Poisoned));
-                Err(Poisoned)
+        let lowered = match self.eval.lowered_fns_cache.retrieve_or_create_entry(function) {
+            Ok(&mut LoweredFnState::Done(fn_id)) => fn_id,
+            Ok(state @ LoweredFnState::InProgress) => {
+                self.diag_ctx.emit_runtime_call_with_recursion(call_loc);
+                *state = LoweredFnState::Done(Err(Poisoned));
+                return Ok(Err(Diverge::ControlFlowPoisoned));
             }
+            Ok(LoweredFnState::Empty) => unreachable!("empty lowered entry should be retried"),
             Err(new_entry_id) => {
                 let fn_id = (|| {
-                    let (body, body_eval_res) = fn_scope.eval_block_to_mir(func.body);
+                    let (body, body_eval_res) = self.eval_block_to_mir(call.func.body);
                     match body_eval_res {
                         Ok(()) => unreachable!("lowerer should guarantee return in function body"),
                         Err(Diverge::BlockEnd(_)) => {}
-                        Err(Diverge::ControlFlowPoisoned) => return Err(Poisoned),
+                        Err(Diverge::ControlFlowPoisoned) => {
+                            return Err(Poisoned);
+                        }
+                        Err(Diverge::ComptimeQuotaExhausted) => {
+                            return Ok(Err(Diverge::ComptimeQuotaExhausted));
+                        }
                     }
                     let return_type = preamble.return_type?;
-                    let fn_id1 = fn_scope.eval.mir_fn_locals.push_copy_slice(&fn_scope.mir_types);
-                    let fn_id2 = fn_scope.eval.mir_fns.push(mir::FnDef {
+                    let fn_id1 = self.eval.mir_fn_locals.push_copy_slice(&self.mir_types);
+                    let fn_id2 = self.eval.mir_fns.push(mir::FnDef {
                         body,
                         param_count: runtime_param_count,
                         return_type,
                     });
                     assert_eq!(fn_id1, fn_id2);
-                    Ok(fn_id1)
+                    Ok(Ok(fn_id1))
                 })();
-                fn_scope.eval.lowered_fns_cache.try_set_lowered(new_entry_id, fn_id)
+                match fn_id {
+                    Ok(Ok(fn_id)) => {
+                        self.eval.lowered_fns_cache.try_set_lowered(new_entry_id, Ok(fn_id))
+                    }
+                    Ok(Err(Diverge::ComptimeQuotaExhausted)) => {
+                        self.eval.lowered_fns_cache.mark_retryable(new_entry_id);
+                        return Ok(Err(Diverge::ComptimeQuotaExhausted));
+                    }
+                    Ok(Err(Diverge::ControlFlowPoisoned | Diverge::BlockEnd(_))) => {
+                        unreachable!(
+                            "invariant: only comptime quota exhaustion is retryable during runtime lowering"
+                        )
+                    }
+                    Err(Poisoned) => {
+                        self.eval.lowered_fns_cache.try_set_lowered(new_entry_id, Err(Poisoned))
+                    }
+                }
             }
         };
         let lowered = match lowered {
             Ok(lowered) => lowered,
-            Err(Poisoned) => return preamble.suppress_poison_iff_diverging_return_type(),
+            Err(Poisoned) => {
+                return preamble.suppress_poison_iff_diverging_return_type();
+            }
         };
 
+        self.lower_runtime_call_at_site(&mut call, lowered, preamble)
+    }
+
+    fn lower_runtime_call_at_site(
+        &mut self,
+        call: &mut Call<'_>,
+        lowered: mir::FnId,
+        preamble: PreambleResult,
+    ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
         let (mir_args, validity) = self.eval.mir_args.push_with_res(|mut pusher| {
-            for (&param, &arg) in params.iter().zip(args) {
-                let state = self.bindings[arg].state?;
+            for (&param, &arg) in call.params.iter().zip(call.args) {
+                let state = call.caller_bindings[arg].state?;
                 let local = match state {
                     LocalState::Runtime(local) => local,
                     LocalState::Comptime(value) => {
@@ -415,7 +478,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                         if self.eval.types.is_comptime_only(ty) {
                             continue;
                         }
-                        let target = self.mir_types.push(ty);
+                        let target = call.caller_mir_types.push(ty);
                         self.eval
                             .instr_stack_buf
                             .push(mir::Instruction::Set { target, expr: mir::Expr::Const(value) });
@@ -433,7 +496,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         let expr = mir::Expr::Call { callee: lowered, args: mir_args };
         let result_type = self.eval.mir_fns[lowered].return_type;
         if result_type == TypeId::NEVER {
-            let target = self.mir_types.push(result_type);
+            let target = call.caller_mir_types.push(result_type);
             self.eval.instr_stack_buf.push(mir::Instruction::Set { target, expr });
             return Ok(Err(Diverge::END));
         }
@@ -446,32 +509,54 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         call: &Call<'_>,
         preamble: PreambleResult,
         values_buf_offset: usize,
-    ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
-        let function =
-            FunctionKey::new(call.closure, &self.eval.maybe_values_buf[values_buf_offset..]);
+    ) -> MaybePoisoned<Result<ComptimeCallResult, Diverge>> {
         preamble.return_type?;
 
-        let new_fn_eval_cache_entry = match self.eval.evaluated_fns_cache.lookup(function) {
-            Err(new_entry) => new_entry,
+        if let Err(QuotaExhaustedError) = self.comptime_quota.spend_branch() {
+            self.diag_ctx.emit_comptime_call_branch_quota_exhausted(
+                call.loc(),
+                self.comptime_quota.limit(),
+                self.eval_branch_quota_start_loc,
+            );
+            return Ok(Err(Diverge::ComptimeQuotaExhausted));
+        }
+
+        let function =
+            FunctionKey::new(call.closure, &self.eval.maybe_values_buf[values_buf_offset..]);
+        let mut existing_cached_value = None;
+        let cache_state = match self.eval.evaluated_fns_cache.lookup(function) {
+            Err(new_entry) => new_entry.result,
             Ok(state) => match state.get() {
-                State::InProgress => {
+                EvaluatedFnState::Empty => state,
+                EvaluatedFnState::InProgress => {
                     self.diag_ctx.emit_infinite_comptime_recursion(call.loc());
-                    state.set(State::Done(Err(Poisoned)));
+                    state.set(EvaluatedFnState::Done(Err(Poisoned)));
                     return Err(Poisoned);
                 }
-                State::Done(value) => {
-                    return match value {
-                        Ok(value) => Ok(Ok(EvalValue::Comptime(value))),
-                        // Cache collapses `Diverge` into Err(Poisoned);
-                        // reconstruct the diverge when the return type was never.
-                        Err(Poisoned) => preamble.suppress_poison_iff_diverging_return_type(),
-                    };
-                }
+                EvaluatedFnState::Done(value) => match value {
+                    Ok(cached)
+                        if self.comptime_quota.replay_cached_call(
+                            cached.branches_consumed,
+                            cached.max_eval_branch_quota_seen,
+                        ) =>
+                    {
+                        self.max_eval_branch_quota_seen =
+                            self.max_eval_branch_quota_seen.max(cached.max_eval_branch_quota_seen);
+                        return Ok(Ok(cached));
+                    }
+                    Ok(cached) => {
+                        existing_cached_value = Some(cached);
+                        state
+                    }
+                    Err(Poisoned) => {
+                        return preamble.suppress_poison_iff_diverging_return_type();
+                    }
+                },
             },
         };
 
         // Pessimistically set result incase we short-circuit before evaluating the body.
-        new_fn_eval_cache_entry.result.set(State::Done(Err(Poisoned)));
+        cache_state.set(EvaluatedFnState::Done(Err(Poisoned)));
 
         let mut poisoned = false;
         for (&param, &arg) in call.params.iter().zip(call.args) {
@@ -507,7 +592,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 }
                 LocalState::Comptime(value) => {
                     // If the calling context was runtime we need to un-materialize any comptime
-                    // values it turned into runtime in `create_fn_scope`.
+                    // values it turned into runtime in `create_fn_scope_frame`.
                     if let Ok(state) = self.bindings[param.value].state.as_mut() {
                         *state = LocalState::Comptime(value);
                     }
@@ -519,19 +604,53 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         }
 
         // Undo pessimistic result poison (allows recursion detection).
-        new_fn_eval_cache_entry.result.set(State::InProgress);
+        cache_state.set(EvaluatedFnState::InProgress);
 
+        let spent_before_body = self.comptime_quota.spent();
         let eval_res = match self.eval_comptime(call.func.body) {
             Ok(()) => unreachable!("lowerer should guarantee return in function body"),
+            Err(Diverge::ControlFlowPoisoned) if preamble.return_type == Ok(TypeId::NEVER) => {
+                Ok(Err(Diverge::END))
+            }
             Err(Diverge::ControlFlowPoisoned) => Err(Poisoned),
+            Err(Diverge::ComptimeQuotaExhausted) => {
+                cache_state.set(match existing_cached_value {
+                    Some(cached) => EvaluatedFnState::Done(Ok(cached)),
+                    // Since this was the first attempt at evaluation and it failed due to quota
+                    // exhaustion we set the empty state to ensure the call can be retried.
+                    None => EvaluatedFnState::Empty,
+                });
+                return Ok(Err(Diverge::ComptimeQuotaExhausted));
+            }
             Err(Diverge::BlockEnd(None)) => Ok(Err(Diverge::END)),
             Err(Diverge::BlockEnd(Some(ret_value))) => Ok(Ok(ret_value)),
         };
-        new_fn_eval_cache_entry.result.set(State::Done(match eval_res {
-            Ok(Ok(value)) => Ok(value),
-            Err(Poisoned) | Ok(Err(_)) => Err(Poisoned),
-        }));
-        eval_res.map(|value_or_diverge| value_or_diverge.map(EvalValue::Comptime))
+        let outcome = match eval_res {
+            Ok(Ok(value)) => ComptimeCallOutcome::Value(value),
+            Err(Poisoned) => {
+                assert!(
+                    existing_cached_value.is_none(),
+                    "cached function re-evaluation should not poison"
+                );
+                cache_state.set(EvaluatedFnState::Done(Err(Poisoned)));
+                return Err(Poisoned);
+            }
+            Ok(Err(diverge)) => {
+                assert_eq!(diverge, Diverge::END, "only end divergence is cacheable");
+                ComptimeCallOutcome::DivergedEnd
+            }
+        };
+        assert!(
+            existing_cached_value.is_none_or(|cached| cached.outcome == outcome),
+            "re-evaluated function produced different cached outcome"
+        );
+        let result = ComptimeCallResult {
+            outcome,
+            branches_consumed: self.comptime_quota.spent() - spent_before_body,
+            max_eval_branch_quota_seen: self.max_eval_branch_quota_seen,
+        };
+        cache_state.set(EvaluatedFnState::Done(Ok(result)));
+        Ok(Ok(result))
     }
 
     pub fn eval_param(
@@ -622,20 +741,20 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                     self.loc(expr.span),
                     true,
                 );
-                return Err(Diverge::END);
+                return Err(Diverge::ControlFlowPoisoned);
             }
         }
 
         if self.is_comptime() {
             let Ok(value) = value.and_then(|value| self.expect_comptime_value(value, expr.span))
             else {
-                return Err(Diverge::END);
+                return Err(Diverge::ControlFlowPoisoned);
             };
             return Err(Diverge::BlockEnd(Some(value)));
         }
 
         let Ok(value) = value else {
-            return Err(Diverge::END);
+            return Err(Diverge::ControlFlowPoisoned);
         };
         let local = match value {
             EvalValue::Runtime { expr, result_type } => {
@@ -646,7 +765,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             EvalValue::Comptime(value) => {
                 if self.is_comptime_only(value) {
                     self.diag_ctx.emit_comptime_only_value_at_runtime(self.loc(expr.span));
-                    return Err(Diverge::END);
+                    return Err(Diverge::ControlFlowPoisoned);
                 }
                 let ty = self.values.type_of_value(value);
                 let target = self.mir_types.push(ty);

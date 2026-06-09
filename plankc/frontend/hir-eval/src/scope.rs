@@ -2,6 +2,7 @@ use crate::{
     Evaluator,
     diagnostics::{BindingLoc, DiagCtx},
     evaluator::CallArgSpansIdx,
+    quota::{ComptimeQuota, QuotaExhaustedError},
 };
 use plank_core::{DenseIndexMap, IndexVec};
 use plank_hir::{self as hir, ExprKind, InstructionKind};
@@ -41,7 +42,11 @@ pub(crate) enum EvalValue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Diverge {
+    /// Signals that a dependency of control flow itself was poisoned and we can no longer
+    /// clearly know what needs to be evaluated or not.
     ControlFlowPoisoned,
+    ComptimeQuotaExhausted,
+    /// Signals a block ended normally, optionally with a comptime-known return value.
     BlockEnd(Option<ValueId>),
 }
 
@@ -63,6 +68,9 @@ pub(crate) struct Scope<'a, 'ctx> {
     pub ctx: EvalContext,
     pub comptime: bool,
     pub conditional: bool,
+    pub comptime_quota: ComptimeQuota,
+    pub eval_branch_quota_start_loc: SrcLoc,
+    pub max_eval_branch_quota_seen: u32,
 
     pub bindings: DenseIndexMap<hir::LocalId, Local>,
     pub mir_types: IndexVec<mir::LocalId, TypeId>,
@@ -74,6 +82,8 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         diag_ctx: &'a mut DiagCtx<'ctx>,
         source: SourceId,
         comptime: bool,
+        comptime_quota: ComptimeQuota,
+        eval_branch_quota_start_loc: SrcLoc,
         ctx: EvalContext,
     ) -> Self {
         Self {
@@ -84,6 +94,9 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             ctx,
             comptime,
             conditional: false,
+            comptime_quota,
+            eval_branch_quota_start_loc,
+            max_eval_branch_quota_seen: crate::quota::DEFAULT_COMPTIME_BRANCH_QUOTA,
 
             bindings: DenseIndexMap::new(),
             mir_types: IndexVec::new(),
@@ -98,7 +111,11 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                     self.diag_ctx.emit_entry_point_missing_terminator(self.loc(span));
                 }
             }
-            Err(Diverge::ControlFlowPoisoned | Diverge::BlockEnd(_)) => {}
+            Err(
+                Diverge::ControlFlowPoisoned
+                | Diverge::ComptimeQuotaExhausted
+                | Diverge::BlockEnd(_),
+            ) => {}
         }
         mir_block
     }
@@ -253,10 +270,8 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 }
             }
         });
-        self.bindings.insert_no_prev(
-            local,
-            Local { state, use_span: expr.span, origin: self.expr_origin(expr) },
-        );
+        self.bindings
+            .insert(local, Local { state, use_span: expr.span, origin: self.expr_origin(expr) });
         Ok(())
     }
 
@@ -289,7 +304,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             }
         });
 
-        self.bindings.insert_no_prev(
+        self.bindings.insert(
             local,
             Local { state: new_state, use_span: expr.span, origin: self.expr_origin(expr) },
         );
@@ -320,7 +335,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                     self.emit(mir::Instruction::Set { target, expr });
                     LocalState::Runtime(target)
                 });
-                self.bindings.insert_no_prev(
+                self.bindings.insert(
                     local,
                     Local { state, use_span: expr.span, origin: self.expr_origin(expr) },
                 );
@@ -368,6 +383,30 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             self.eval_instr(instr)?;
         }
         Ok(())
+    }
+
+    fn expect_comptime_bool_condition(&mut self, condition: hir::LocalId) -> Result<bool, Diverge> {
+        let binding = self.bindings[condition];
+        let state = match binding.state {
+            Ok(state) => state,
+            Err(Poisoned) => return Err(Diverge::ControlFlowPoisoned),
+        };
+        match state {
+            LocalState::Comptime(ValueId::TRUE) => Ok(true),
+            LocalState::Comptime(ValueId::FALSE) => Ok(false),
+            LocalState::Comptime(value) => {
+                self.diag_ctx.emit_type_mismatch_simple(
+                    TypeId::BOOL,
+                    self.values.type_of_value(value),
+                    self.loc(binding.use_span),
+                );
+                Err(Diverge::ControlFlowPoisoned)
+            }
+            LocalState::Runtime(_) => {
+                self.diag_ctx.emit_runtime_eval_in_comptime(self.loc(binding.use_span));
+                Err(Diverge::ControlFlowPoisoned)
+            }
+        }
     }
 
     fn eval_assign(&mut self, target: hir::LocalId, expr: hir::Expr) -> Result<(), Diverge> {
@@ -477,9 +516,15 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 });
                 match (then_res, else_res) {
                     // Control flow was poisoned in either branch so we have to assume everything
-                    // was poisoned and bubble up
+                    // was poisoned and bubble up. Furthermore if control flow was poisoned there
+                    // is no point retrying evaluation if one of the branches failed from
+                    // insufficient quota.
                     (Err(Diverge::ControlFlowPoisoned), _)
                     | (_, Err(Diverge::ControlFlowPoisoned)) => Err(Diverge::ControlFlowPoisoned),
+                    (Err(Diverge::ComptimeQuotaExhausted), _)
+                    | (_, Err(Diverge::ComptimeQuotaExhausted)) => {
+                        Err(Diverge::ComptimeQuotaExhausted)
+                    }
                     (Err(Diverge::BlockEnd(_)), Err(Diverge::BlockEnd(_))) => {
                         Err(Diverge::BlockEnd(None))
                     }
@@ -514,12 +559,18 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         body: hir::BlockId,
     ) -> Result<(), Diverge> {
         if self.is_comptime() {
-            if let Ok(span) = self.hir.block_spans[condition_block] {
-                self.diag_ctx.emit_not_yet_implemented("comptime while", self.loc(span));
-            }
-            return Err(Diverge::ControlFlowPoisoned);
+            self.eval_comptime_while(condition_block, condition, body)
+        } else {
+            self.eval_runtime_while(condition_block, condition, body)
         }
+    }
 
+    fn eval_runtime_while(
+        &mut self,
+        condition_block: hir::BlockId,
+        condition: hir::LocalId,
+        body: hir::BlockId,
+    ) -> Result<(), Diverge> {
         let (condition_block, mir_condition_local) = self.with_instructions(|this| {
             this.eval_block_inline(condition_block)?;
             let binding = this.bindings[condition];
@@ -556,14 +607,44 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         let condition = mir_condition_local?;
         let (body, body_res) = self.eval_block_to_mir(body);
         match body_res {
-            Err(Diverge::ControlFlowPoisoned) => {
-                return Err(Diverge::ControlFlowPoisoned);
+            Err(err @ (Diverge::ControlFlowPoisoned | Diverge::ComptimeQuotaExhausted)) => {
+                return Err(err);
             }
             Err(Diverge::BlockEnd(_)) | Ok(()) => {}
         }
         self.emit(mir::Instruction::While { condition_block, condition, body });
 
         Ok(())
+    }
+
+    fn eval_comptime_while(
+        &mut self,
+        condition_block: hir::BlockId,
+        condition: hir::LocalId,
+        body: hir::BlockId,
+    ) -> Result<(), Diverge> {
+        // Comptime quota is the user-facing loop bound here; a separate LoopLimit would either be
+        // redundant with that quota or silently cap explicitly raised quotas.
+        loop {
+            self.eval_block_inline(condition_block)?;
+            let condition_value = self.expect_comptime_bool_condition(condition)?;
+            if !condition_value {
+                return Ok(());
+            }
+
+            if let Err(QuotaExhaustedError) = self.comptime_quota.spend_branch() {
+                let span =
+                    self.hir.block_spans[condition_block].expect("condition block wihtout span");
+                self.diag_ctx.emit_comptime_loop_branch_quota_exhausted(
+                    self.loc(span),
+                    self.comptime_quota.limit(),
+                    self.eval_branch_quota_start_loc,
+                );
+                return Err(Diverge::ComptimeQuotaExhausted);
+            }
+
+            self.eval_block_inline(body)?;
+        }
     }
 
     pub fn loc(&self, span: SourceSpan) -> SrcLoc {

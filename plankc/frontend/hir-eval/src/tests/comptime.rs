@@ -1,4 +1,5 @@
 use super::*;
+use crate::quota::DEFAULT_COMPTIME_BRANCH_QUOTA;
 
 #[test]
 fn test_comptime_only_return_caches_per_non_comptime_arg_value() {
@@ -1537,5 +1538,392 @@ fn test_uninit_memptr_in_comptime() {
         1 | const x = @uninit(memptr);
           |           ^^^^^^^^^^^^^^^ memptr requires runtime allocation
         "#],
+    );
+}
+
+#[test]
+fn test_set_eval_branch_quota_runtime_arg() {
+    assert_diagnostics(
+        r#"
+        init {
+            let n = @evm_calldataload(0);
+            let x = comptime { @set_eval_branch_quota(n); 1 };
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: attempting to evaluate runtime expression in comptime context
+         --> main.plk:3:47
+          |
+        3 |     let x = comptime { @set_eval_branch_quota(n); 1 };
+          |                                               ^ runtime expression
+        "#],
+    );
+}
+
+#[test]
+fn test_set_eval_branch_quota_wrong_arg_type() {
+    assert_diagnostics(
+        r#"
+        const x = comptime { @set_eval_branch_quota(true); 1 };
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: no valid match for builtin signature
+         --> main.plk:1:22
+          |
+        1 | const x = comptime { @set_eval_branch_quota(true); 1 };
+          |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `@set_eval_branch_quota` cannot be called with (bool)
+          |
+          = note: `@set_eval_branch_quota` accepts (u256)
+        "#],
+    );
+}
+
+#[test]
+fn test_set_eval_branch_quota_too_large() {
+    assert_diagnostics(
+        r#"
+        const x = comptime { @set_eval_branch_quota(4294967296); 1 };
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: eval branch quota is too large
+         --> main.plk:1:45
+          |
+        1 | const x = comptime { @set_eval_branch_quota(4294967296); 1 };
+          |                                             ^^^^^^^^^^ quota must fit in u32
+          |
+          = note: maximum supported quota is 4294967295
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_nested_while_and_if_evaluates_loop() {
+    assert_lowers_to(
+        std_project(
+            r#"
+        init {
+            let mut x: u256 = comptime {
+                let mut outer = 0;
+                let mut total = 0;
+                while outer < 3 {
+                    let mut inner = 0;
+                    while inner < 2 {
+                        if inner == 0 {
+                            let add = outer + 1;
+                            total = total + add;
+                        } else {
+                            let add = outer + 2;
+                            total = total + add;
+                        }
+                        inner = inner + 1;
+                    }
+                    outer = outer + 1;
+                }
+                total
+            };
+            @evm_stop();
+        }
+        "#,
+        ),
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 15
+            %1 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_nested_comptime_block_shares_caller_quota() {
+    assert_eq!(1000, DEFAULT_COMPTIME_BRANCH_QUOTA);
+    assert_diagnostics(
+        std_project(
+            r#"
+        const x = comptime {
+            let mut i = 0;
+            while i < 1000 {
+                i = i + 1;
+            }
+            comptime {
+                let mut j = 0;
+                while j == 0 {
+                    j = 1;
+                }
+                j
+            }
+        };
+        init { @evm_stop(); }
+        "#,
+        ),
+        &[r#"
+        error: comptime branch quota exhausted
+          --> main.plk:8:15
+           |
+         8 |         while j == 0 {
+           |               ^^^^^^^ evaluating this loop exceeded the comptime branch quota
+           |
+           = note: current eval branch quota is 1000
+        note: comptime evaluation began here
+          --> main.plk:1:1
+           |
+         1 | / const x = comptime {
+         2 | |     let mut i = 0;
+         3 | |     while i < 1000 {
+         4 | |         i = i + 1;
+        ...  |
+        13 | | };
+           | |__^
+        "#],
+    );
+}
+
+#[test]
+fn test_cached_const_references_do_not_consume_quota() {
+    assert_eq!(1000, DEFAULT_COMPTIME_BRANCH_QUOTA);
+    assert_lowers_to(
+        std_project(
+            r#"
+        const Cached = comptime {
+            let mut i = 0;
+            while i < 1000 {
+                i = i + 1;
+            }
+            i
+        };
+
+        const x = comptime {
+            Cached;
+            Cached
+        };
+
+        init {
+            let mut y: u256 = x;
+            @evm_stop();
+        }
+        "#,
+        ),
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 1000
+            %1 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_cached_const_does_not_increase_caller_quota() {
+    assert_eq!(1000, DEFAULT_COMPTIME_BRANCH_QUOTA);
+    assert_eq!(2000, DEFAULT_COMPTIME_BRANCH_QUOTA * 2);
+    assert_diagnostics(
+        std_project(
+            r#"
+        const F = comptime {
+            @set_eval_branch_quota(2000);
+            let mut i = 0;
+            while i < 2000 {
+                i = i + 1;
+            }
+            i
+        };
+
+        init {
+            let mut warm: u256 = comptime { F };
+            let mut x: u256 = comptime {
+                let start = F;
+                let mut i = 0;
+                while i < 2000 {
+                    i = i + 1;
+                }
+                start + i
+            };
+            @evm_stop();
+        }
+        "#,
+        ),
+        &[r#"
+        error: comptime branch quota exhausted
+          --> main.plk:14:15
+           |
+        14 |         while i < 2000 {
+           |               ^^^^^^^^^ evaluating this loop exceeded the comptime branch quota
+           |
+           = note: current eval branch quota is 1000
+        note: comptime evaluation began here
+          --> main.plk:9:1
+           |
+         9 | / init {
+        10 | |     let mut warm: u256 = comptime { F };
+        11 | |     let mut x: u256 = comptime {
+        12 | |         let start = F;
+        ...  |
+        19 | |     @evm_stop();
+        20 | | }
+           | |_^
+        "#],
+    );
+}
+
+#[test]
+fn test_const_eval_uses_fresh_quota() {
+    assert_eq!(1000, DEFAULT_COMPTIME_BRANCH_QUOTA);
+    assert_eq!(1001, DEFAULT_COMPTIME_BRANCH_QUOTA + 1);
+    assert_diagnostics(
+        std_project(
+            r#"
+        const C = comptime {
+            let mut i = 0;
+            while i < 1001 {
+                i = i + 1;
+            }
+            i
+        };
+
+        init {
+            let mut warm: u256 = comptime {
+                @set_eval_branch_quota(1001);
+                C
+            };
+            @evm_stop();
+        }
+        "#,
+        ),
+        &[r#"
+        error: comptime branch quota exhausted
+         --> main.plk:3:11
+          |
+        3 |     while i < 1001 {
+          |           ^^^^^^^^^ evaluating this loop exceeded the comptime branch quota
+          |
+          = note: current eval branch quota is 1000
+        note: comptime evaluation began here
+         --> main.plk:1:1
+          |
+        1 | / const C = comptime {
+        2 | |     let mut i = 0;
+        3 | |     while i < 1001 {
+        4 | |         i = i + 1;
+        5 | |     }
+        6 | |     i
+        7 | | };
+          | |__^
+        "#],
+    );
+}
+
+#[test]
+fn test_referenced_const_quota_exhaustion_emits_once() {
+    assert_eq!(1000, DEFAULT_COMPTIME_BRANCH_QUOTA);
+    assert_eq!(1001, DEFAULT_COMPTIME_BRANCH_QUOTA + 1);
+    assert_diagnostics(
+        std_project(
+            r#"
+        const C = comptime {
+            let mut i = 0;
+            while i < 1001 {
+                i = i + 1;
+            }
+            i
+        };
+
+        init {
+            let mut x: u256 = C;
+            @evm_stop();
+        }
+        "#,
+        ),
+        &[r#"
+        error: comptime branch quota exhausted
+         --> main.plk:3:11
+          |
+        3 |     while i < 1001 {
+          |           ^^^^^^^^^ evaluating this loop exceeded the comptime branch quota
+          |
+          = note: current eval branch quota is 1000
+        note: comptime evaluation began here
+         --> main.plk:1:1
+          |
+        1 | / const C = comptime {
+        2 | |     let mut i = 0;
+        3 | |     while i < 1001 {
+        4 | |         i = i + 1;
+        5 | |     }
+        6 | |     i
+        7 | | };
+          | |__^
+        "#],
+    );
+}
+
+#[test]
+fn test_unused_const_comptime_while_branch_quota_exhausted() {
+    assert_eq!(1000, DEFAULT_COMPTIME_BRANCH_QUOTA);
+    assert_diagnostics(
+        r#"
+        const Bad = comptime {
+            while true {}
+        };
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: comptime branch quota exhausted
+         --> main.plk:2:11
+          |
+        2 |     while true {}
+          |           ^^^^ evaluating this loop exceeded the comptime branch quota
+          |
+          = note: current eval branch quota is 1000
+        note: comptime evaluation began here
+         --> main.plk:1:1
+          |
+        1 | / const Bad = comptime {
+        2 | |     while true {}
+        3 | | };
+          | |__^
+        "#],
+    );
+}
+
+#[test]
+fn scoped_set_eval_in_branch() {
+    assert_lowers_to(
+        r#"
+        init {
+            let mut cond = false;
+            if cond {
+                @set_eval_branch_quota(3);
+                comptime {
+                    let x = 3;
+                }
+            } else {
+
+            }
+
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : bool = false
+            %1 : bool = %0
+            if %1 {
+                %2 : void = void_unit
+            } else {
+                %2 : void = void_unit
+            }
+            %3 : void = %2
+            %4 : never = @evm_stop()
+        }
+        "#,
     );
 }

@@ -264,6 +264,54 @@ impl DiagCtx<'_> {
             .emit(self);
     }
 
+    pub fn emit_eval_branch_quota_too_large(&mut self, loc: SrcLoc) {
+        Diagnostic::error("eval branch quota is too large")
+            .primary(loc.source, loc.span, "quota must fit in u32")
+            .note(format!("maximum supported quota is {}", u32::MAX))
+            .emit(self);
+    }
+
+    pub fn emit_comptime_loop_branch_quota_exhausted(
+        &mut self,
+        loc: SrcLoc,
+        limit: u32,
+        eval_branch_quota_start_loc: SrcLoc,
+    ) {
+        self.emit_comptime_quota_exhausted(loc, limit, eval_branch_quota_start_loc, "loop")
+    }
+
+    pub fn emit_comptime_call_branch_quota_exhausted(
+        &mut self,
+        loc: SrcLoc,
+        limit: u32,
+        eval_branch_quota_start_loc: SrcLoc,
+    ) {
+        self.emit_comptime_quota_exhausted(loc, limit, eval_branch_quota_start_loc, "call")
+    }
+
+    fn emit_comptime_quota_exhausted(
+        &mut self,
+        loc: SrcLoc,
+        limit: u32,
+        eval_branch_quota_start_loc: SrcLoc,
+        reason: &'static str,
+    ) {
+        Diagnostic::error("comptime branch quota exhausted")
+            .primary(
+                loc.source,
+                loc.span,
+                format!("evaluating this {reason} exceeded the comptime branch quota"),
+            )
+            .note(format!("current eval branch quota is {limit}"))
+            .claim(
+                Claim::new(Level::Note, "comptime evaluation began here").element(
+                    Annotations::new(eval_branch_quota_start_loc.source)
+                        .no_label(eval_branch_quota_start_loc.span, AnnotationKind::Primary),
+                ),
+            )
+            .emit(self);
+    }
+
     pub fn emit_entry_point_missing_terminator(&mut self, loc: SrcLoc) {
         Diagnostic::error("entry point must end with explicit terminator")
             .primary(loc.source, loc.span, "execution may reach end of entry point")
@@ -283,12 +331,6 @@ impl DiagCtx<'_> {
                 loc.span,
                 format!("`{}` depends on itself", self.session.lookup_name(name)),
             )
-            .emit(self);
-    }
-
-    pub fn emit_not_yet_implemented(&mut self, functionality: &str, loc: SrcLoc) {
-        Diagnostic::error(format!("{functionality} not yet implemented"))
-            .element(Annotations::new(loc.source).no_label(loc.span, AnnotationKind::Primary))
             .emit(self);
     }
 

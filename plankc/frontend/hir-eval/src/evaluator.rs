@@ -1,13 +1,16 @@
-use plank_core::{DenseIndexMap, IndexVec, list_of_lists::ListOfLists, newtype_index};
+use plank_core::{
+    DenseIndexMap, IndexVec, dense_index_map::Entry, list_of_lists::ListOfLists, newtype_index,
+};
 use plank_hir::{self as hir, ConstId, Hir};
 use plank_mir as mir;
-use plank_session::{MaybePoisoned, Poisoned, SourceSpan, StrId};
+use plank_session::{MaybePoisoned, Poisoned, SourceSpan, SrcLoc, StrId, ZERO_SPAN};
 use plank_values::{DefOrigin, Field, Type, TypeId, TypeInterner, Value, ValueId, ValueInterner};
 
 use crate::{
     diagnostics::DiagCtx,
     functions::{EvaluatedFunctionCache, LoweredFunctionsCache},
     operators::OperatorTable,
+    quota::ComptimeQuota,
     scope::{Diverge, EvalContext, LocalState, Scope},
 };
 
@@ -15,6 +18,22 @@ use crate::{
 pub(crate) enum State<T> {
     InProgress,
     Done(T),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ConstEvalResult {
+    Value(ValueId),
+    Poisoned,
+    QuotaExhausted,
+}
+
+impl ConstEvalResult {
+    fn value(self) -> MaybePoisoned<ValueId> {
+        match self {
+            ConstEvalResult::Value(value) => Ok(value),
+            ConstEvalResult::Poisoned | ConstEvalResult::QuotaExhausted => Err(Poisoned),
+        }
+    }
 }
 
 newtype_index! {
@@ -28,7 +47,7 @@ pub(crate) struct Evaluator<'a> {
     pub mir_fn_locals: ListOfLists<mir::FnId, TypeId>,
     pub types: &'a TypeInterner,
 
-    pub evaluated_consts: DenseIndexMap<ConstId, State<MaybePoisoned<ValueId>>>,
+    pub evaluated_consts: DenseIndexMap<ConstId, State<ConstEvalResult>>,
     pub values: &'a mut ValueInterner,
     pub hir: &'a Hir,
 
@@ -94,22 +113,32 @@ impl<'a> Evaluator<'a> {
         diag_ctx: &mut DiagCtx<'a>,
     ) -> MaybePoisoned<ValueId> {
         let const_def = self.hir.consts[const_id];
-        match self.evaluated_consts.get_mut(const_id) {
-            Some(State::Done(vid)) => return *vid,
-            Some(state @ State::InProgress) => {
+        match self.evaluated_consts.entry(const_id) {
+            Entry::Occupied(State::Done(result)) => return result.value(),
+            Entry::Occupied(state @ State::InProgress) => {
                 diag_ctx.emit_const_cycle(const_def.name, const_def.loc());
-                *state = State::Done(Err(Poisoned));
+                *state = State::Done(ConstEvalResult::Poisoned);
                 return Err(Poisoned);
             }
-            None => {}
+            Entry::Vacant(vacant) => vacant.insert(State::InProgress),
         };
 
-        self.evaluated_consts.insert_no_prev(const_id, State::InProgress);
-
-        let mut scope = Scope::new(self, diag_ctx, const_def.source_id, true, EvalContext::Other);
+        let mut scope = Scope::new(
+            self,
+            diag_ctx,
+            const_def.source_id,
+            true,
+            ComptimeQuota::default(),
+            const_def.loc(),
+            EvalContext::Other,
+        );
         match scope.eval_comptime(const_def.body) {
+            Err(Diverge::ComptimeQuotaExhausted) => {
+                self.evaluated_consts[const_id] = State::Done(ConstEvalResult::QuotaExhausted);
+                return Err(Poisoned);
+            }
             Err(Diverge::ControlFlowPoisoned | Diverge::BlockEnd(_)) => {
-                self.evaluated_consts[const_id] = State::Done(Err(Poisoned));
+                self.evaluated_consts[const_id] = State::Done(ConstEvalResult::Poisoned);
                 return Err(Poisoned);
             }
             Ok(_) => {}
@@ -121,16 +150,20 @@ impl<'a> Evaluator<'a> {
                 unreachable!("local in comptime set to runtime instead of poisoned")
             }
         });
+        let const_result = match value {
+            Ok(value) => ConstEvalResult::Value(value),
+            Err(Poisoned) => ConstEvalResult::Poisoned,
+        };
+
         match self.evaluated_consts.get_mut(const_id) {
-            Some(State::Done(Err(Poisoned))) => {
-                // Already poisoned, don't update
-            }
+            Some(State::Done(ConstEvalResult::Poisoned)) => {}
             Some(state @ State::InProgress) => {
-                *state = State::Done(value);
+                *state = State::Done(const_result);
                 self.try_name_type(const_def.name, value);
             }
-            None | Some(State::Done(Ok(_))) => {
-                unreachable!("invariant: unset / set to value while evaluating")
+            None
+            | Some(State::Done(ConstEvalResult::Value(_) | ConstEvalResult::QuotaExhausted)) => {
+                unreachable!("invariant: const state changed while evaluating")
             }
         }
 
@@ -154,8 +187,19 @@ impl<'a> Evaluator<'a> {
         block: hir::BlockId,
         diag_ctx: &mut DiagCtx<'a>,
     ) -> mir::FnId {
-        let mut scope =
-            Scope::new(self, diag_ctx, self.hir.entry_source, false, EvalContext::Other);
+        let eval_branch_quota_start_loc = match self.hir.block_spans[block] {
+            Ok(span) => SrcLoc::new(self.hir.entry_source, span),
+            Err(Poisoned) => SrcLoc::new(self.hir.entry_source, ZERO_SPAN),
+        };
+        let mut scope = Scope::new(
+            self,
+            diag_ctx,
+            self.hir.entry_source,
+            false,
+            ComptimeQuota::default(),
+            eval_branch_quota_start_loc,
+            EvalContext::Other,
+        );
 
         let body = scope.eval_entry_point_body(block);
 

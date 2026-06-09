@@ -8,13 +8,38 @@ use plank_hir::ValueId;
 use plank_mir as mir;
 use plank_session::{MaybePoisoned, Poisoned};
 
-use crate::evaluator::State;
-
 newtype_index! {
     pub(crate) struct LoweredFnIdx;
 }
 
 pub(crate) type Param = MaybePoisoned<ValueId>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ComptimeCallOutcome {
+    Value(ValueId),
+    DivergedEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ComptimeCallResult {
+    pub outcome: ComptimeCallOutcome,
+    pub branches_consumed: u32,
+    pub max_eval_branch_quota_seen: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EvaluatedFnState {
+    Empty,
+    InProgress,
+    Done(MaybePoisoned<ComptimeCallResult>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LoweredFnState {
+    Empty,
+    InProgress,
+    Done(MaybePoisoned<mir::FnId>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FunctionKey<'a> {
@@ -29,7 +54,7 @@ impl<'a> FunctionKey<'a> {
 }
 
 struct LoweredFn {
-    state: State<MaybePoisoned<mir::FnId>>,
+    state: LoweredFnState,
     closure: ValueId,
 }
 
@@ -56,13 +81,25 @@ impl LoweredFunctionsCache {
         fn_id: MaybePoisoned<mir::FnId>,
     ) -> MaybePoisoned<mir::FnId> {
         match &mut self.functions[id].state {
-            State::Done(Err(Poisoned)) => Err(Poisoned),
-            State::Done(Ok(_)) => {
+            LoweredFnState::Empty => {
+                unreachable!("invariant: lowering entry reset before result was stored")
+            }
+            LoweredFnState::Done(Err(Poisoned)) => Err(Poisoned),
+            LoweredFnState::Done(Ok(_)) => {
                 unreachable!("invariant: cache corrupted")
             }
-            s @ State::InProgress => {
-                *s = State::Done(fn_id);
+            s @ LoweredFnState::InProgress => {
+                *s = LoweredFnState::Done(fn_id);
                 fn_id
+            }
+        }
+    }
+
+    pub fn mark_retryable(&mut self, id: LoweredFnIdx) {
+        match &mut self.functions[id].state {
+            state @ LoweredFnState::InProgress => *state = LoweredFnState::Empty,
+            LoweredFnState::Empty | LoweredFnState::Done(_) => {
+                unreachable!("invariant: only in-progress lowering can be marked retryable")
             }
         }
     }
@@ -70,7 +107,7 @@ impl LoweredFunctionsCache {
     pub fn retrieve_or_create_entry<'a>(
         &mut self,
         func: FunctionKey<'a>,
-    ) -> Result<&mut State<MaybePoisoned<mir::FnId>>, LoweredFnIdx> {
+    ) -> Result<&mut LoweredFnState, LoweredFnIdx> {
         use std::hash::BuildHasher;
         let hash = self.hasher.hash_one(func);
         let entry = self.dedup.entry(
@@ -88,12 +125,18 @@ impl LoweredFunctionsCache {
         match entry {
             Entry::Occupied(occupied) => {
                 let id = *occupied.get();
-                Ok(&mut self.functions[id].state)
+                match &mut self.functions[id].state {
+                    state @ LoweredFnState::Empty => {
+                        *state = LoweredFnState::InProgress;
+                        Err(id)
+                    }
+                    state @ (LoweredFnState::InProgress | LoweredFnState::Done(_)) => Ok(state),
+                }
             }
             Entry::Vacant(vacant) => {
                 let new_entry_id = self
                     .functions
-                    .push(LoweredFn { state: State::InProgress, closure: func.closure });
+                    .push(LoweredFn { state: LoweredFnState::InProgress, closure: func.closure });
                 let id2 = self.comptime_params.push_copy_slice(func.params);
                 assert_eq!(new_entry_id, id2);
                 vacant.insert(new_entry_id);
@@ -104,13 +147,13 @@ impl LoweredFunctionsCache {
 }
 
 struct EvaluatedHeader {
-    result: Cell<State<MaybePoisoned<ValueId>>>,
+    result: Cell<EvaluatedFnState>,
     closure: ValueId,
     params: u32,
 }
 
 pub(crate) struct EvaluatedFn<'a> {
-    pub result: &'a Cell<State<MaybePoisoned<ValueId>>>,
+    pub result: &'a Cell<EvaluatedFnState>,
     pub closure: ValueId,
     pub params: &'a [Param],
 }
@@ -146,7 +189,7 @@ impl EvaluatedFunctionCache {
     pub fn lookup<'s, 'k>(
         &'s self,
         key: FunctionKey<'k>,
-    ) -> Result<&'s Cell<State<MaybePoisoned<ValueId>>>, EvaluatedFn<'s>> {
+    ) -> Result<&'s Cell<EvaluatedFnState>, EvaluatedFn<'s>> {
         use std::hash::BuildHasher;
         let hash = self.hasher.hash_one(key);
         let dedup = unsafe { &mut *self.dedup.get() };
@@ -168,7 +211,7 @@ impl EvaluatedFunctionCache {
                 let header = new_eval_ptr as *mut EvaluatedHeader;
                 let params = key.params.len() as u32;
                 header.write(EvaluatedHeader {
-                    result: Cell::new(State::InProgress),
+                    result: Cell::new(EvaluatedFnState::Empty),
                     closure: key.closure,
                     params,
                 });
