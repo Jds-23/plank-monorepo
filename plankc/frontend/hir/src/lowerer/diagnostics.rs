@@ -70,28 +70,6 @@ impl BlockLowerer<'_> {
             .emit(*self.session.borrow_mut());
     }
 
-    pub(crate) fn error_init_outside_entry(&self, span: TokenSpan) {
-        self.error_outside_entry("init", span);
-    }
-
-    pub(crate) fn error_run_outside_entry(&self, span: TokenSpan) {
-        self.error_outside_entry("run", span);
-    }
-
-    fn error_outside_entry(&self, kind: &str, span: TokenSpan) {
-        Diagnostic::error(format!("`{kind}` not allowed here"))
-            .primary(
-                self.source_id,
-                self.lexed.tokens_src_span(span),
-                format!("only the entry file may contain `{kind}`"),
-            )
-            .claim(
-                Claim::new(Level::Note, "entry file")
-                    .element(Element::Origin { path: SourceId::ROOT }),
-            )
-            .emit(*self.session.borrow_mut());
-    }
-
     pub(crate) fn error_shadowing_primitive_type(&self, name: StrId, span: TokenSpan) {
         let source_span = self.lexed.tokens_src_span(span);
         let name_str = self.lookup_name(name);
@@ -196,10 +174,28 @@ impl BlockLowerer<'_> {
             .emit(*self.session.borrow_mut());
     }
 
-    pub(crate) fn error_missing_init_block(&self) {
+    /// The entry file unconditionally requires an `init` block (it *is* the
+    /// deployment entry point), regardless of whether it has a `run` block.
+    pub(crate) fn error_missing_entry_init_block(&self) {
         Diagnostic::error("missing init block")
             .element(Element::Origin { path: SourceId::ROOT })
             .note("the entry file must contain an init block")
+            .emit(*self.session.borrow_mut());
+    }
+
+    /// Imported files don't need an `init` block — unless they contain a `run`
+    /// block, which signals the file is meant to be usable as an entry file
+    /// itself. Unlike the entry file, the error points at the `run` block
+    /// because it is what creates the requirement.
+    pub(crate) fn error_imported_run_without_init_block(&self, run_span: TokenSpan) {
+        let source_span = self.lexed.tokens_src_span(run_span);
+        Diagnostic::error("run block without init block")
+            .primary(
+                self.source_id,
+                source_span,
+                "run block requires an init block in the same file",
+            )
+            .note("if you did not intend this file to be an independently compilable contract remove the `run` block")
             .emit(*self.session.borrow_mut());
     }
 

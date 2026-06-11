@@ -498,46 +498,6 @@ fn test_duplicate_const_def() {
 }
 
 #[test]
-fn test_init_and_run_outside_entry() {
-    let project = TestProject::root(
-        r#"
-        import m::other::*;
-        init {}
-        "#,
-    )
-    .add_file(
-        "other",
-        r#"
-        init {}
-        run {}
-        "#,
-    )
-    .add_module("m", "");
-    let rendered = render_project_diagnostics(project);
-    let expected = dedent_preserve_blank_lines(
-        r#"
-        error: `init` not allowed here
-         --> other.plk:1:1
-          |
-        1 | init {}
-          | ^^^^^^^ only the entry file may contain `init`
-          |
-        note: entry file
-         --> main.plk
-        error: `run` not allowed here
-         --> other.plk:2:1
-          |
-        2 | run {}
-          | ^^^^^^ only the entry file may contain `run`
-          |
-        note: entry file
-         --> main.plk
-        "#,
-    );
-    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
-}
-
-#[test]
 fn test_import_name_collision() {
     let project = TestProject::root(
         r#"
@@ -744,6 +704,23 @@ fn test_missing_init_block() {
     let rendered = render_diagnostics(
         r#"
         const x = 1;
+        "#,
+    );
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: missing init block
+         --> main.plk
+          = note: the entry file must contain an init block
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
+}
+
+#[test]
+fn test_root_run_without_init() {
+    let rendered = render_diagnostics(
+        r#"
+        run {}
         "#,
     );
     let expected = dedent_preserve_blank_lines(
