@@ -93,15 +93,17 @@ impl<'a> Rewriter<'a> {
             self.emit_block(bb);
         }
         let new_entry = self.state.block_map[&old_entry_id];
-        self.dst.functions[new_id] = Function::new(new_entry, old_func.num_outputs());
+        self.dst.functions[new_id] =
+            Function::new(new_entry, old_func.num_outputs(), old_func.source());
     }
 
     fn reserve_function_id(&mut self, old_id: FunctionId) -> (FunctionId, bool) {
         match self.state.function_map.entry(old_id) {
             Entry::Occupied(entry) => (*entry.get(), false),
             Entry::Vacant(entry) => {
+                let old_func = self.src.function(old_id);
                 let placeholder =
-                    Function::new(BasicBlockId::ZERO, self.src.function(old_id).num_outputs());
+                    Function::new(BasicBlockId::ZERO, old_func.num_outputs(), old_func.source());
                 let new_id = self.dst.functions.push(placeholder);
                 entry.insert(new_id);
                 (new_id, true)
@@ -368,7 +370,7 @@ mod tests {
         run_pass,
     };
     use sir_data::assert_ir_display;
-    use sir_parser::{EmitConfig, parse_or_panic};
+    use sir_parser::{EmitConfig, parse_or_panic, parse_or_panic_with_sources};
 
     #[test]
     fn test_sccp_unused_elim_and_defragment() {
@@ -496,6 +498,40 @@ mod tests {
             "#,
         );
         assert_eq!(Legalizer::default().run(&ir, &store), Ok(()));
+    }
+
+    #[test]
+    fn test_preserves_function_sources() {
+        let input = r#"
+            fn init:
+                entry {
+                    value = const 1
+                    result = icall @helper value
+                    sstore value result
+                    stop
+                }
+
+            fn helper:
+                entry value -> result {
+                    result = add value value
+                    iret
+                }
+
+            fn dead:
+                entry {
+                    stop
+                }
+        "#;
+
+        let (mut ir, sources) = parse_or_panic_with_sources(input, EmitConfig::init_only());
+        assert!(sources.function_by_name(&ir, "dead").is_some());
+
+        let store = AnalysesStore::default();
+        run_pass(&mut Defragmenter::default(), &mut ir, &store);
+
+        assert_eq!(sources.function_by_name(&ir, "init"), Some(ir.init_entry));
+        assert!(sources.function_by_name(&ir, "helper").is_some());
+        assert_eq!(sources.function_by_name(&ir, "dead"), None);
     }
 
     #[test]

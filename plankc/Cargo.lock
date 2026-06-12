@@ -3053,9 +3053,11 @@ name = "sir-data"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "bitflags",
  "plank-core",
  "plank-test-utils",
  "pretty_assertions",
+ "proptest",
  "sir-assembler",
  "thiserror",
 ]
@@ -3077,6 +3079,7 @@ dependencies = [
  "bumpalo",
  "chumsky",
  "logos",
+ "plank-core",
  "sir-data",
  "sir-passes",
  "smallvec",
@@ -3097,6 +3100,16 @@ dependencies = [
  "sir-parser",
  "smallvec",
  "thiserror",
+]
+
+[[package]]
+name = "sir-passes-tests"
+version = "0.1.0"
+dependencies = [
+ "pretty_assertions",
+ "sir-data",
+ "sir-parser",
+ "sir-passes",
 ]
 
 [[package]]

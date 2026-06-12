@@ -382,17 +382,22 @@ impl fmt::Display for EthIRProgram {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Function {
-    pub entry_bb_id: BasicBlockId,
-    pub outputs: u32,
+    entry_bb_id: BasicBlockId,
+    outputs: u32,
+    source: Option<OpaqueSourceId>,
 }
 
 impl Function {
-    pub fn new(entry_bb_id: BasicBlockId, outputs: u32) -> Self {
-        Self { entry_bb_id, outputs }
+    pub fn new(entry_bb_id: BasicBlockId, outputs: u32, source: Option<OpaqueSourceId>) -> Self {
+        Self { entry_bb_id, outputs, source }
     }
 
     pub fn entry(&self) -> BasicBlockId {
         self.entry_bb_id
+    }
+
+    pub fn source(&self) -> Option<OpaqueSourceId> {
+        self.source
     }
 
     pub fn get_inputs(&self, basic_blocks: &IndexVec<BasicBlockId, BasicBlock>) -> u32 {

@@ -4,10 +4,12 @@ use bumpalo::{
     Bump,
     collections::{String as BString, Vec as BVec},
 };
+use plank_core::IndexVec;
 use sir_data::{
-    BasicBlockId, Branch, Control, DataId, EthIRProgram, FunctionId, LocalId, Operation,
+    BasicBlockId, Branch, Control, DataId, EthIRProgram, FunctionId, LocalId, OpaqueSourceId,
+    Operation,
     builder::{BuildError, EthIRBuilder},
-    operation::{OpBuildError, OpExtraData},
+    operation::{OpBuildError, OpExtraData, OperationKind},
 };
 use smallvec::SmallVec;
 use std::collections::{HashMap, hash_map::Entry};
@@ -21,6 +23,36 @@ type BBox<'arena, T> = &'arena mut T;
 pub struct SirAstSemaError<'arena> {
     pub spans: BBox<'arena, [Span]>,
     pub reason: BString<'arena>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FunctionSourceMap {
+    sources: IndexVec<OpaqueSourceId, String>,
+}
+
+impl FunctionSourceMap {
+    fn with_capacity(capacity: usize) -> Self {
+        Self { sources: IndexVec::with_capacity(capacity) }
+    }
+
+    fn push(&mut self, source: String) -> OpaqueSourceId {
+        self.sources.push(source)
+    }
+
+    pub fn get(&self, source: OpaqueSourceId) -> Option<&str> {
+        self.sources.get(source).map(String::as_str)
+    }
+
+    pub fn function_name(&self, ir: &EthIRProgram, function: FunctionId) -> Option<&str> {
+        let source = ir.functions.get(function)?.source()?;
+        self.get(source)
+    }
+
+    pub fn function_by_name(&self, ir: &EthIRProgram, name: &str) -> Option<FunctionId> {
+        ir.functions_iter()
+            .find(|func| self.function_name(ir, func.id()) == Some(name))
+            .map(|func| func.id())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +98,20 @@ macro_rules! format_in {
             write!(&mut output, $($arg)*).expect("Arena string write failed");
             output
         }
+    }
+}
+
+fn param_supplies_extra(kind: OperationKind, param: &ParamExpr<'_, '_>) -> bool {
+    match param {
+        ParamExpr::FuncRef(_) | ParamExpr::DataRef(_) => true,
+        ParamExpr::Num(_) => matches!(
+            kind,
+            OperationKind::SetSmallConst
+                | OperationKind::SetLargeConst
+                | OperationKind::StaticAllocZeroed
+                | OperationKind::StaticAllocAnyBytes
+        ),
+        ParamExpr::NameRef(_) => false,
     }
 }
 
@@ -127,7 +173,18 @@ pub fn emit_ir<'ast, 'arena: 'ast, 'src: 'arena>(
     ast: &'ast Ast<'arena, 'src>,
     config: EmitConfig<'_>,
 ) -> Result<EthIRProgram, SirAstSemaError<'arena>> {
+    let (program, _) = emit_ir_with_sources(arena, ast, config)?;
+    Ok(program)
+}
+
+/// Emits IR from
+pub fn emit_ir_with_sources<'ast, 'arena: 'ast, 'src: 'arena>(
+    arena: &'arena Bump,
+    ast: &'ast Ast<'arena, 'src>,
+    config: EmitConfig<'_>,
+) -> Result<(EthIRProgram, FunctionSourceMap), SirAstSemaError<'arena>> {
     let mut ir_builder = EthIRBuilder::new();
+    let mut sources = FunctionSourceMap::with_capacity(ast.functions.len());
 
     let mut data_names: HashMap<&'src str, Spanned<DataId>> =
         HashMap::with_capacity(ast.data_segments.len());
@@ -283,17 +340,30 @@ pub fn emit_ir<'ast, 'arena: 'ast, 'src: 'arena>(
 
                     locals_buffer.clear();
                     for param in stmt.params.iter() {
-                        let ParamExpr::NameRef(name) = param else { continue };
-                        let id =
-                            local_name_to_id.get(name.inner).ok_or_else(|| SirAstSemaError {
-                                spans: arena.alloc([name.span()]),
-                                reason: format_in!(
-                                    arena,
-                                    "Local {:?} not defined in function",
-                                    name.inner
-                                ),
-                            })?;
-                        locals_buffer.push(id.inner);
+                        let id = match param {
+                            ParamExpr::NameRef(name) => {
+                                let Some(spanned) = local_name_to_id.get(name.inner) else {
+                                    return Err(SirAstSemaError {
+                                        spans: arena.alloc([name.span()]),
+                                        reason: format_in!(
+                                            arena,
+                                            "Local {:?} not defined in function",
+                                            name.inner
+                                        ),
+                                    });
+                                };
+                                spanned.inner
+                            }
+                            ParamExpr::Num(num) if !param_supplies_extra(kind, param) => {
+                                let local = bb_builder.new_local();
+                                bb_builder.add_set_const_op(local, num.inner);
+                                local
+                            }
+                            ParamExpr::FuncRef(_) | ParamExpr::DataRef(_) | ParamExpr::Num(_) => {
+                                continue;
+                            }
+                        };
+                        locals_buffer.push(id);
                     }
                     let ins_end_outs_start = locals_buffer.len();
                     for output in stmt.assigns.iter() {
@@ -337,10 +407,10 @@ pub fn emit_ir<'ast, 'arena: 'ast, 'src: 'arena>(
                                         ),
                                     }),
                             ),
-                            ParamExpr::Num(num) => {
+                            ParamExpr::Num(num) if param_supplies_extra(kind, param) => {
                                 Some(Ok(Spanned::new(OpExtraData::Num(num.inner), num.span())))
                             }
-                            ParamExpr::NameRef(_) => None,
+                            ParamExpr::NameRef(_) | ParamExpr::Num(_) => None,
                         }),
                     );
                     let extra = extras.next().transpose()?.map_or(OpExtraData::Empty, |e| e.inner);
@@ -568,7 +638,9 @@ pub fn emit_ir<'ast, 'arena: 'ast, 'src: 'arena>(
             })?;
         }
 
-        let func_id = func_builder.finish(entry_bb_id.expect("function didn't have at least 1 bb"));
+        let source = Some(sources.push(func.name.inner.to_owned()));
+        let func_id = func_builder
+            .finish_with_source(entry_bb_id.expect("function didn't have at least 1 bb"), source);
         func_ids.insert(func.name.inner, func_id);
     }
 
@@ -627,5 +699,5 @@ pub fn emit_ir<'ast, 'arena: 'ast, 'src: 'arena>(
         None
     };
 
-    Ok(ir_builder.build(init_entry, main_entry))
+    Ok((ir_builder.build(init_entry, main_entry), sources))
 }
