@@ -254,6 +254,24 @@ impl crate::scope::Scope<'_, '_> {
                 let result = if op_equals { lhs == rhs } else { lhs != rhs };
                 Ok(Ok(EvalValue::Comptime(result.into())))
             }
+            (op_equals, Ok(PrimitiveType::CBytes)) => {
+                let (LocalState::Comptime(lhs), LocalState::Comptime(rhs)) = (lhs_state, rhs_state)
+                else {
+                    unreachable!("invariant: cbytes is comptime-only")
+                };
+                let Value::Bytes(lhs) = self.values.lookup(lhs) else {
+                    unreachable!("invariant: type checked as cbytes")
+                };
+                let Value::Bytes(rhs) = self.values.lookup(rhs) else {
+                    unreachable!("invariant: type checked as cbytes")
+                };
+                let lhs =
+                    self.diag_ctx.session.lookup_bytes_slice(lhs.contents, lhs.start, lhs.end);
+                let rhs =
+                    self.diag_ctx.session.lookup_bytes_slice(rhs.contents, rhs.start, rhs.end);
+                let result = if op_equals { lhs == rhs } else { lhs != rhs };
+                Ok(Ok(EvalValue::Comptime(result.into())))
+            }
             (
                 true,
                 Ok(PrimitiveType::U256 | PrimitiveType::MemoryPointer | PrimitiveType::Bool),

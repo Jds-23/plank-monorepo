@@ -61,7 +61,7 @@ impl<'a> DisplayMir<'a> {
                 }
                 write!(f, "{pad}}}")
             }
-            Value::Type(_) | Value::Closure { .. } => {
+            Value::Type(_) | Value::Bytes(_) | Value::Closure { .. } => {
                 unreachable!("comptime-only value in MIR")
             }
         }
@@ -98,6 +98,17 @@ impl<'a> DisplayMir<'a> {
                     write!(f, " ")?;
                 }
                 write!(f, "}}")
+            }
+            Expr::DataOffset { contents, start } => {
+                write!(f, "data_offset(hex\"")?;
+                for byte in self.session.lookup_bytes(contents) {
+                    write!(f, "{byte:02x}")?;
+                }
+                write!(f, "\")")?;
+                if start != 0 {
+                    write!(f, " + {start}")?;
+                }
+                Ok(())
             }
         }
     }

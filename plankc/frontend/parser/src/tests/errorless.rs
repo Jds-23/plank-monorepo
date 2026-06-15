@@ -126,6 +126,125 @@ fn test_literal_decimal() {
     );
 }
 
+#[test]
+fn test_literal_string() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const x = "hello";
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "x"
+                " "
+                "="
+                " "
+                StringLiteral
+                    "\"hello\""
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_literal_string_escapes() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const x = "escaped \" quote";
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "x"
+                " "
+                "="
+                " "
+                StringLiteral
+                    "\"escaped \\\" quote\""
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_literal_hex_string() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const x = hex"01af";
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "x"
+                " "
+                "="
+                " "
+                StringLiteral
+                    "hex\"01af\""
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_literal_string_nul_escape() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const x = "nul\0byte";
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "x"
+                " "
+                "="
+                " "
+                StringLiteral
+                    "\"nul\\0byte\""
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_literal_string_merged_segments() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const x = "abc" "123" hex"01ab";
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "x"
+                " "
+                "="
+                " "
+                StringLiteral
+                    "\"abc\""
+                    " "
+                    "\"123\""
+                    " "
+                    "hex\"01ab\""
+                ";"
+        "#,
+    );
+}
+
 // =============================================================================
 // Identifiers & Paths
 // =============================================================================

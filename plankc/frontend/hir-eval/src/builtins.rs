@@ -3,8 +3,8 @@ use plank_hir as hir;
 use plank_mir as mir;
 use plank_session::{Builtin, MaybePoisoned, RuntimeBuiltin, SourceSpan, builtins::BuiltinKind};
 use plank_values::{
-    Field, PrimitiveType, StructView, Type, TypeId, TypeInterner, Value, ValueId, ValueInterner,
-    builtins as builtin_sigs,
+    CBytes, Field, PrimitiveType, StructView, Type, TypeId, TypeInterner, Value, ValueId,
+    ValueInterner, builtins as builtin_sigs,
 };
 
 use crate::{
@@ -228,6 +228,58 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                     self.max_eval_branch_quota_seen.max(requested_quota);
                 Ok(Ok(EvalValue::Comptime(ValueId::VOID)))
             }
+            Builtin::CompileError => {
+                let &[message] = args else { unreachable!("arg count checked") };
+                let message = self.expect_bytes_arg(message, builtin, expr_span)?;
+                let message = self.diag_ctx.session.lookup_bytes_lossy(
+                    message.contents,
+                    message.start,
+                    message.end,
+                );
+                self.diag_ctx.emit_custom_comptime_error(message, self.loc(expr_span));
+                Ok(Err(Diverge::ControlFlowPoisoned))
+            }
+            Builtin::SliceCBytes => {
+                let &[bytes, start, end] = args else { unreachable!("arg count checked") };
+                let bytes = self.expect_bytes_arg(bytes, builtin, expr_span)?;
+                let start = self.expect_comptime_u256(start, builtin, "slice start", expr_span)?;
+                let end = self.expect_comptime_u256(end, builtin, "slice end", expr_span)?;
+                let len = bytes.end - bytes.start;
+                if start > end || end > U256::from(len) {
+                    self.diag_ctx.emit_bytes_slice_out_of_bounds(start, end, len, expr_loc);
+                    return Err(Poisoned);
+                }
+                let start = u32::try_from(start).expect("start <= end <= len which fits u32");
+                let end = u32::try_from(end).expect("end <= len which fits u32");
+                Ok(Ok(EvalValue::Comptime(self.eval.values.intern_bytes(
+                    bytes.contents,
+                    bytes.start + start,
+                    bytes.start + end,
+                ))))
+            }
+            Builtin::Keccak256CBytes => {
+                let &[bytes] = args else { unreachable!("arg count checked") };
+                let bytes = self.expect_bytes_arg(bytes, builtin, expr_span)?;
+                let slice = self.diag_ctx.session.lookup_bytes_slice(
+                    bytes.contents,
+                    bytes.start,
+                    bytes.end,
+                );
+                let hash = U256::from_be_bytes(alloy_primitives::keccak256(slice).0);
+                Ok(Ok(EvalValue::Comptime(self.eval.values.intern_num(hash))))
+            }
+            Builtin::DataOffset => {
+                let &[bytes] = args else { unreachable!("arg count checked") };
+                let bytes = self.expect_bytes_arg(bytes, builtin, expr_span)?;
+                if self.is_comptime() {
+                    self.diag_ctx.emit_data_offset_in_comptime(expr_loc);
+                    return Err(Poisoned);
+                }
+                Ok(Ok(EvalValue::Runtime {
+                    expr: mir::Expr::DataOffset { contents: bytes.contents, start: bytes.start },
+                    result_type: TypeId::U256,
+                }))
+            }
             _ => unreachable!("not a comptime builtin: {builtin}"),
         }
     }
@@ -414,7 +466,10 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         match ty.as_primitive() {
             Ok(PrimitiveType::U256) => {
                 let target = self.mir_types.push(TypeId::U256);
-                self.emit(mir::Instruction::Set { target, expr: mir::Expr::Const(ValueId::ZERO) });
+                self.emit(mir::Instruction::Set {
+                    target,
+                    expr: mir::Expr::Const(ValueId::ZERO_NUM),
+                });
                 target
             }
             Ok(PrimitiveType::Bool) => {
@@ -426,7 +481,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 let size_local = self.mir_types.push(TypeId::U256);
                 self.emit(mir::Instruction::Set {
                     target: size_local,
-                    expr: mir::Expr::Const(ValueId::ZERO),
+                    expr: mir::Expr::Const(ValueId::ZERO_NUM),
                 });
                 let args = self.eval.mir_args.push_copy_slice(&[size_local]);
                 let target = self.mir_types.push(TypeId::MEMORY_POINTER);
@@ -444,8 +499,13 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 self.emit(mir::Instruction::Set { target, expr: mir::Expr::Const(ValueId::VOID) });
                 target
             }
-            Ok(PrimitiveType::Type | PrimitiveType::Function | PrimitiveType::Never) => {
-                unreachable!("void/type/function/never do not produce runtime locals")
+            Ok(
+                PrimitiveType::Type
+                | PrimitiveType::Function
+                | PrimitiveType::CBytes
+                | PrimitiveType::Never,
+            ) => {
+                unreachable!("comptime-only/never types do not produce runtime locals")
             }
             Err(struct_ref) => {
                 let fields = self.with_locals_buf(|this, offset| {
@@ -475,7 +535,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         expr_span: SourceSpan,
     ) -> MaybePoisoned<(StructView<'a>, Field, u32)> {
         let r#struct = self.expect_struct_type(ty, builtin, expr_span)?;
-        let index = self.expect_comptime_field_index(index_arg, builtin, expr_span)?;
+        let index = self.expect_comptime_u256(index_arg, builtin, "field index", expr_span)?;
         let field_and_index = u32::try_from(index).ok().and_then(|index| {
             let &field = r#struct.fields.get(index as usize)?;
             Some((field, index))
@@ -509,16 +569,34 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         Err(Poisoned)
     }
 
-    fn expect_comptime_field_index(
+    fn expect_bytes_arg(
         &mut self,
         arg_local: hir::LocalId,
         builtin: Builtin,
+        span: SourceSpan,
+    ) -> MaybePoisoned<CBytes> {
+        let state = self.bindings[arg_local].state?;
+        if let LocalState::Comptime(vid) = state
+            && let Value::Bytes(bytes) = self.values.lookup(vid)
+        {
+            return Ok(bytes);
+        }
+        let actual_ty = self.state_type(state);
+        self.diag_ctx.emit_no_matching_builtin_signature(builtin, &[actual_ty], self.loc(span));
+        Err(Poisoned)
+    }
+
+    fn expect_comptime_u256(
+        &mut self,
+        arg_local: hir::LocalId,
+        builtin: Builtin,
+        arg_name: &str,
         span: SourceSpan,
     ) -> MaybePoisoned<U256> {
         let arg_binding = self.bindings[arg_local];
         let state = arg_binding.state?;
         let LocalState::Comptime(vid) = state else {
-            self.diag_ctx.emit_expected_comptime_arg(builtin, "field index", self.loc(span));
+            self.diag_ctx.emit_expected_comptime_arg(builtin, arg_name, self.loc(span));
             return Err(Poisoned);
         };
         let Value::BigNum(n) = self.values.lookup(vid) else {
@@ -620,7 +698,7 @@ fn validate_uninit_type(
     ty: TypeId,
     types: &TypeInterner,
     diag_ctx: &mut DiagCtx<'_>,
-    loc: SrcLoc,
+    expr: SrcLoc,
     field_loc: Option<SrcLoc>,
 ) -> bool {
     match ty.as_primitive() {
@@ -629,14 +707,15 @@ fn validate_uninit_type(
             | PrimitiveType::Bool
             | PrimitiveType::MemoryPointer
             | PrimitiveType::Void
-            | PrimitiveType::Type,
+            | PrimitiveType::Type
+            | PrimitiveType::CBytes,
         ) => false,
         Ok(invalid @ (PrimitiveType::Function | PrimitiveType::Never)) => {
             // `field_loc` is set when recursing into struct fields
             if let Some(field_loc) = field_loc {
-                diag_ctx.emit_invalid_uninit_struct_field(invalid, loc, field_loc);
+                diag_ctx.emit_invalid_uninit_struct_field(invalid, expr, field_loc);
             } else {
-                diag_ctx.emit_invalid_uninit_type(invalid, loc);
+                diag_ctx.emit_invalid_uninit_type(invalid, expr);
             }
             true
         }
@@ -646,7 +725,7 @@ fn validate_uninit_type(
             for field in view.fields {
                 let field_loc = SrcLoc::new(view.def_loc.source, field.def_span);
                 has_invalid_uninit |=
-                    validate_uninit_type(field.ty, types, diag_ctx, loc, Some(field_loc));
+                    validate_uninit_type(field.ty, types, diag_ctx, expr, Some(field_loc));
             }
             has_invalid_uninit
         }
@@ -659,7 +738,7 @@ fn contains_memptr(ty: TypeId, types: &TypeInterner) -> bool {
         Ok(_) => false,
         Err(struct_ref) => {
             let view = types.lookup_struct(struct_ref);
-            view.fields.iter().any(|f| contains_memptr(f.ty, types))
+            view.fields.iter().any(|field| contains_memptr(field.ty, types))
         }
     }
 }
@@ -671,10 +750,11 @@ fn build_uninit_comptime(
     buf: &mut Vec<ValueId>,
 ) -> ValueId {
     match ty.as_primitive() {
-        Ok(PrimitiveType::U256) => values.intern(Value::BigNum(U256::ZERO)),
-        Ok(PrimitiveType::Bool) => values.intern(Value::Bool(false)),
-        Ok(PrimitiveType::Void) => values.intern(Value::Void),
-        Ok(PrimitiveType::Type) => values.intern(Value::Type(TypeId::VOID)),
+        Ok(PrimitiveType::U256) => ValueId::ZERO_NUM,
+        Ok(PrimitiveType::Bool) => ValueId::FALSE,
+        Ok(PrimitiveType::Void) => ValueId::VOID,
+        Ok(PrimitiveType::Type) => values.intern_type(TypeId::VOID),
+        Ok(PrimitiveType::CBytes) => ValueId::BYTES_EMPTY,
         Ok(PrimitiveType::MemoryPointer | PrimitiveType::Function | PrimitiveType::Never) => {
             unreachable!("memptr/function/never cannot appear in comptime uninit struct")
         }

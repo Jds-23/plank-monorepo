@@ -2,11 +2,19 @@ use crate::{DefOrigin, FnDefId, TypeId, ValueId, bignum_interner::*};
 use alloy_primitives::U256;
 use hashbrown::{DefaultHashBuilder, HashTable, hash_table::Entry};
 use plank_core::{IndexVec, list_of_lists::ListOfLists, newtype_index};
+use plank_session::BytesId;
 use std::hash::BuildHasher;
 
 newtype_index! {
     struct CompoundIdx;
     struct CaptureIdx;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CBytes {
+    pub contents: BytesId,
+    pub start: u32,
+    pub end: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +23,7 @@ enum StoredValue {
     Bool(bool),
     BigNum(BigNumId),
     Type(TypeId),
+    Bytes(CBytes),
     Closure { fn_def: FnDefId, captures: CaptureIdx },
     StructVal { ty: TypeId, children: CompoundIdx },
 }
@@ -25,6 +34,7 @@ pub enum Value<'a> {
     Bool(bool),
     BigNum(U256),
     Type(TypeId),
+    Bytes(CBytes),
     Closure { fn_def: FnDefId, captures: &'a [(ValueId, DefOrigin)] },
     StructVal { ty: TypeId, fields: &'a [ValueId] },
 }
@@ -36,6 +46,7 @@ impl Value<'_> {
             Value::Bool(_) => TypeId::BOOL,
             Value::BigNum(_) => TypeId::U256,
             Value::Type(_) => TypeId::TYPE,
+            Value::Bytes(_) => TypeId::CBYTES,
             Value::Closure { .. } => TypeId::FUNCTION,
             Value::StructVal { ty, .. } => *ty,
         }
@@ -68,6 +79,7 @@ fn stored_to_value<'a>(
         StoredValue::Bool(b) => Value::Bool(b),
         StoredValue::BigNum(bid) => Value::BigNum(big_nums.lookup(bid)),
         StoredValue::Type(t) => Value::Type(t),
+        StoredValue::Bytes(bytes) => Value::Bytes(bytes),
         StoredValue::Closure { fn_def, captures: idx } => {
             Value::Closure { fn_def, captures: &captures[idx] }
         }
@@ -90,8 +102,12 @@ impl ValueInterner {
         assert_eq!(new_interner.intern(Value::Void), ValueId::VOID);
         assert_eq!(new_interner.intern(Value::Bool(false)), ValueId::FALSE);
         assert_eq!(new_interner.intern(Value::Bool(true)), ValueId::TRUE);
-        assert_eq!(new_interner.intern_num(U256::ZERO), ValueId::ZERO);
-        assert_eq!(new_interner.intern_num(U256::ONE), ValueId::ONE);
+        assert_eq!(new_interner.intern_num(U256::ZERO), ValueId::ZERO_NUM);
+        assert_eq!(new_interner.intern_num(U256::ONE), ValueId::ONE_NUM);
+        assert_eq!(
+            new_interner.intern_bytes(plank_session::EMPTY_BYTES, 0, 0),
+            ValueId::BYTES_EMPTY
+        );
         new_interner
     }
 
@@ -109,6 +125,10 @@ impl ValueInterner {
 
     pub fn intern_type(&mut self, ty: TypeId) -> ValueId {
         self.intern(Value::Type(ty))
+    }
+
+    pub fn intern_bytes(&mut self, contents: BytesId, start: u32, end: u32) -> ValueId {
+        self.intern(Value::Bytes(CBytes { contents, start, end }))
     }
 
     pub fn intern(&mut self, value: Value<'_>) -> ValueId {
@@ -136,6 +156,7 @@ impl ValueInterner {
                     Value::Bool(b) => StoredValue::Bool(b),
                     Value::BigNum(n) => StoredValue::BigNum(self.big_nums.intern(n)),
                     Value::Type(t) => StoredValue::Type(t),
+                    Value::Bytes(bytes) => StoredValue::Bytes(bytes),
                     Value::Closure { fn_def, captures } => StoredValue::Closure {
                         fn_def,
                         captures: self.captures.push_copy_slice(captures),
@@ -195,6 +216,24 @@ mod tests {
         let mut interner = ValueInterner::new();
         let v = interner.intern(Value::BigNum(uint!(67_U256)));
         assert_eq!(interner.lookup(v), Value::BigNum(uint!(67_U256)));
+    }
+
+    #[test]
+    fn intern_bytes_by_identity() {
+        let mut session = plank_session::Session::new();
+        let mut interner = ValueInterner::new();
+        let hello = session.intern_bytes(b"hello");
+        let xelx = session.intern_bytes(b"xelx");
+
+        let slice = interner.intern_bytes(hello, 1, 3);
+        assert_eq!(interner.intern_bytes(hello, 1, 3), slice);
+        assert_ne!(interner.intern_bytes(hello, 1, 4), slice);
+        assert_ne!(interner.intern_bytes(hello, 0, 3), slice);
+
+        // "hello"[1..3] and "xelx"[1..3] are both `el`: identical by value but
+        // distinct by origin, so they must stay distinct values.
+        assert_eq!(session.lookup_bytes_slice(hello, 1, 3), session.lookup_bytes_slice(xelx, 1, 3));
+        assert_ne!(interner.intern_bytes(xelx, 1, 3), slice);
     }
 
     #[test]

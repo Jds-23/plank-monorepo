@@ -27,6 +27,9 @@ macro_rules! define_builtins {
         comptime_dynamic_builtins {
             $($cd_const:ident $cd_str:literal => $cd_variant:ident($cd_arg_count:literal);)*
         }
+        builtin_attribute {
+            $($builtin_attr:ident = $builtin_attr_str:literal;)*
+        }
     ) => {
         pub mod builtin_names {
             $(pub const $pt_const: &str = $pt_str;)*
@@ -34,24 +37,28 @@ macro_rules! define_builtins {
             $(pub const $ro_const: &str = $ro_str;)*
             $(pub const $ct_const: &str = $ct_str;)*
             $(pub const $cd_const: &str = $cd_str;)*
+            $(pub const $builtin_attr: &str = $builtin_attr_str;)*
         }
 
         #[doc(hidden)]
         #[repr(u32)]
         #[allow(clippy::upper_case_acronyms)]
         enum BuiltinStrIdx {
+            _EmptyString,
             $($pt_type,)*
             $($rf_variant,)*
             $($ro_variant,)*
             $($ct_variant,)*
             $($cd_variant,)*
+            $($builtin_attr,)*
         }
 
-        $(pub const $pt_const: StrId = StrId::new(BuiltinStrIdx::$pt_type as u32);)*
-        $(pub const $rf_const: StrId = StrId::new(BuiltinStrIdx::$rf_variant as u32);)*
-        $(pub const $ro_const: StrId = StrId::new(BuiltinStrIdx::$ro_variant as u32);)*
-        $(pub const $ct_const: StrId = StrId::new(BuiltinStrIdx::$ct_variant as u32);)*
-        $(pub const $cd_const: StrId = StrId::new(BuiltinStrIdx::$cd_variant as u32);)*
+        $(pub const $pt_const: StrId = StrId::from_builtin_index(BuiltinStrIdx::$pt_type as u32);)*
+        $(pub const $rf_const: StrId = StrId::from_builtin_index(BuiltinStrIdx::$rf_variant as u32);)*
+        $(pub const $ro_const: StrId = StrId::from_builtin_index(BuiltinStrIdx::$ro_variant as u32);)*
+        $(pub const $ct_const: StrId = StrId::from_builtin_index(BuiltinStrIdx::$ct_variant as u32);)*
+        $(pub const $cd_const: StrId = StrId::from_builtin_index(BuiltinStrIdx::$cd_variant as u32);)*
+        $(pub const $builtin_attr: StrId = StrId::from_builtin_index(BuiltinStrIdx::$builtin_attr as u32);)*
 
         pub fn inject_builtins(interner: &mut Session) {
             $(assert_eq!(interner.intern(builtin_names::$pt_const), $pt_const);)*
@@ -59,6 +66,7 @@ macro_rules! define_builtins {
             $(assert_eq!(interner.intern(builtin_names::$ro_const), $ro_const);)*
             $(assert_eq!(interner.intern(builtin_names::$ct_const), $ct_const);)*
             $(assert_eq!(interner.intern(builtin_names::$cd_const), $cd_const);)*
+            $(assert_eq!(interner.intern($builtin_attr_str), $builtin_attr);)*
         }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +175,7 @@ define_builtins! {
         MEMORY_POINTER = "memptr" => MemoryPointer;
         TYPE = "type" => Type;
         FUNCTION = "function" => Function;
+        CBYTES = "cbytes" => CBytes;
         NEVER = "never" => Never;
     }
 
@@ -346,6 +355,12 @@ define_builtins! {
         FIELD_COUNT "@field_count" => FieldCount;
         IN_COMPTIME "@in_comptime" => InComptime;
         SET_EVAL_BRANCH_QUOTA "@set_eval_branch_quota" => SetEvalBranchQuota;
+        COMPILE_ERROR "@compile_error" => CompileError;
+
+        // Comptime Bytes
+        SLICE_CBYTES "@slice_cbytes" => SliceCBytes;
+        KECCAK256_CBYTES "@keccak256_cbytes" => Keccak256CBytes;
+        DATA_OFFSET "@data_offset" => DataOffset;
     }
 
     comptime_dynamic_builtins {
@@ -353,6 +368,10 @@ define_builtins! {
         GET_FIELD "@get_field" => GetField(2);
         SET_FIELD "@set_field" => SetField(3);
         UNINIT "@uninit" => Uninit(1);
+    }
+
+    builtin_attribute {
+        LENGTH = "length";
     }
 }
 

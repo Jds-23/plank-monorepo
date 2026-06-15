@@ -164,6 +164,191 @@ fn test_comptime_unsupported_evm_builtin() {
 }
 
 #[test]
+fn test_compile_error_builtin() {
+    assert_diagnostics(
+        r#"
+        const x = @compile_error("custom failure");
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: custom failure
+         --> main.plk:1:11
+          |
+        1 | const x = @compile_error("custom failure");
+          |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ custom compile error triggered here
+        "#],
+    );
+}
+
+#[test]
+fn test_compile_error_escaped_message() {
+    assert_diagnostics(
+        r#"
+        const x = @compile_error("quote: \" slash: \\");
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: quote: " slash: \
+         --> main.plk:1:11
+          |
+        1 | const x = @compile_error("quote: \" slash: \\");
+          |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ custom compile error triggered here
+        "#],
+    );
+}
+
+#[test]
+fn test_compile_error_accepts_cbytes_const() {
+    assert_diagnostics(
+        r#"
+        const msg = "from const";
+        const x = @compile_error(msg);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: from const
+         --> main.plk:2:11
+          |
+        2 | const x = @compile_error(msg);
+          |           ^^^^^^^^^^^^^^^^^^^ custom compile error triggered here
+        "#],
+    );
+}
+
+#[test]
+fn test_compile_error_accepts_cbytes_let() {
+    assert_diagnostics(
+        r#"
+        init {
+            let msg = "from let";
+            @compile_error(msg);
+        }
+        "#,
+        &[r#"
+        error: from let
+         --> main.plk:3:5
+          |
+        3 |     @compile_error(msg);
+          |     ^^^^^^^^^^^^^^^^^^^ custom compile error triggered here
+        "#],
+    );
+}
+
+#[test]
+fn test_compile_error_accepts_hex_cbytes() {
+    assert_diagnostics(
+        r#"
+        const x = @compile_error(hex"686578206661696c757265");
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: hex failure
+         --> main.plk:1:11
+          |
+        1 | const x = @compile_error(hex"686578206661696c757265");
+          |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ custom compile error triggered here
+        "#],
+    );
+}
+
+#[test]
+fn test_compile_error_accepts_non_utf8_cbytes() {
+    assert_diagnostics(
+        r#"
+        const x = @compile_error(hex"ff");
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: �
+         --> main.plk:1:11
+          |
+        1 | const x = @compile_error(hex"ff");
+          |           ^^^^^^^^^^^^^^^^^^^^^^^ custom compile error triggered here
+        "#],
+    );
+}
+
+#[test]
+fn test_runtime_cbytes() {
+    assert_diagnostics(
+        r#"
+        init {
+            let mut x = "";
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: use of comptime-only value at runtime
+         --> main.plk:2:17
+          |
+        2 |     let mut x = "";
+          |                 ^^ reference to comptime-only value
+        "#],
+    );
+}
+
+#[test]
+fn test_compile_error_requires_string_literal() {
+    assert_diagnostics(
+        r#"
+        const x = @compile_error(1);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: no valid match for builtin signature
+         --> main.plk:1:11
+          |
+        1 | const x = @compile_error(1);
+          |           ^^^^^^^^^^^^^^^^^ `@compile_error` cannot be called with (u256)
+          |
+          = note: `@compile_error` accepts (cbytes)
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_cbytes_literals() {
+    assert_lowers_to(
+        r#"
+        const same = "hello" == "hello";
+        const different = "hello" != "world";
+        const empty = "" == "";
+        const empty_different = "" != "x";
+        const escaped = "\x5cq" == "\\q";
+        const hex_equal = "abc" == hex"616263";
+        const hex_different = "abc" != hex"616264";
+        const arbitrary_bytes = hex"00ff" == hex"00ff";
+        init {
+            let mut a: bool = same;
+            let mut b: bool = different;
+            let mut c: bool = empty;
+            let mut d: bool = empty_different;
+            let mut e: bool = escaped;
+            let mut f: bool = hex_equal;
+            let mut g: bool = hex_different;
+            let mut h: bool = arbitrary_bytes;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : bool = true
+            %1 : bool = true
+            %2 : bool = true
+            %3 : bool = true
+            %4 : bool = true
+            %5 : bool = true
+            %6 : bool = true
+            %7 : bool = true
+            %8 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
 fn test_comptime_evm_wrong_arg_type_in_const() {
     assert_diagnostics(
         r#"
@@ -1474,7 +1659,7 @@ fn test_uninit_invalid_type() {
         1 | const x = @uninit(never);
           |           ^^^^^^^^^^^^^^ type 'never' cannot be uninitialized
           |
-          = help: @uninit only supports u256, bool, void, type, memptr and struct types
+          = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
         "#],
     );
 }
@@ -1519,7 +1704,7 @@ fn test_uninit_struct_with_function_field() {
         1 | const Bad = struct { a: u256, b: function };
           |                               ----------- type 'function' cannot be uninitialized
           |
-          = help: @uninit only supports u256, bool, void, type, memptr and struct types
+          = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
         "#],
     );
 }
@@ -1537,6 +1722,420 @@ fn test_uninit_memptr_in_comptime() {
           |
         1 | const x = @uninit(memptr);
           |           ^^^^^^^^^^^^^^^ memptr requires runtime allocation
+        "#],
+    );
+}
+
+#[test]
+fn test_uninit_type_direct_runtime_scope_is_comptime_value() {
+    assert_lowers_to(
+        r#"
+        init {
+            let x = @uninit(type);
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_uninit_cbytes_direct_runtime_scope_is_comptime_value() {
+    assert_lowers_to(
+        r#"
+        init {
+            let x = @uninit(cbytes);
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_uninit_struct_with_comptime_only_field_direct_runtime_scope_is_comptime_value() {
+    assert_lowers_to(
+        r#"
+        const Wrapper = struct { t: type, n: u256 };
+        init {
+            let x = @uninit(Wrapper);
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_uninit_struct_with_memptr_and_invalid_field_reports_invalid_field() {
+    assert_diagnostics(
+        r#"
+        const Bad = struct { ptr: memptr, f: function };
+        const x = @uninit(Bad);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: struct contains field that cannot be uninitialized
+         --> main.plk:2:11
+          |
+        2 | const x = @uninit(Bad);
+          |           ^^^^^^^^^^^^ cannot use @uninit on this struct
+          |
+         ::: main.plk:1:35
+          |
+        1 | const Bad = struct { ptr: memptr, f: function };
+          |                                   ----------- type 'function' cannot be uninitialized
+          |
+          = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
+        "#],
+    );
+}
+
+#[test]
+fn test_uninit_struct_reports_all_invalid_fields() {
+    assert_diagnostics(
+        r#"
+        const Bad = struct { f: function, g: function };
+        const x = @uninit(Bad);
+        init { @evm_stop(); }
+        "#,
+        &[
+            r#"
+            error: struct contains field that cannot be uninitialized
+             --> main.plk:2:11
+              |
+            2 | const x = @uninit(Bad);
+              |           ^^^^^^^^^^^^ cannot use @uninit on this struct
+              |
+             ::: main.plk:1:22
+              |
+            1 | const Bad = struct { f: function, g: function };
+              |                      ----------- type 'function' cannot be uninitialized
+              |
+              = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
+            "#,
+            r#"
+            error: struct contains field that cannot be uninitialized
+             --> main.plk:2:11
+              |
+            2 | const x = @uninit(Bad);
+              |           ^^^^^^^^^^^^ cannot use @uninit on this struct
+              |
+             ::: main.plk:1:35
+              |
+            1 | const Bad = struct { f: function, g: function };
+              |                                   ----------- type 'function' cannot be uninitialized
+              |
+              = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
+            "#,
+        ],
+    );
+}
+
+#[test]
+fn test_merged_cbytes_literals() {
+    assert_lowers_to(
+        r#"
+        const merged = "abc" "123" hex"01ab" == "abc123\x01\xab";
+        init {
+            let mut a: bool = merged;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : bool = true
+            %1 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_cbytes_dot_length_attribute() {
+    assert_lowers_to(
+        r#"
+        const len_plain = "hello".length;
+        const len_empty = "".length;
+        const len_escaped = "a\x00b\n".length;
+        const len_merged = ("abc" "123" hex"01ab").length;
+        init {
+            let mut a: u256 = len_plain;
+            let mut b: u256 = len_empty;
+            let mut c: u256 = len_escaped;
+            let mut d: u256 = len_merged;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 5
+            %1 : u256 = 0
+            %2 : u256 = 4
+            %3 : u256 = 8
+            %4 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_cbytes_unknown_attribute() {
+    assert_diagnostics(
+        r#"
+        const bad = "hello".foo;
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: unknown cbytes attribute
+         --> main.plk:1:13
+          |
+        1 | const bad = "hello".foo;
+          |             ^^^^^^^^^^^ `cbytes` has no attribute `foo`
+          |
+          = help: available attribute: `.length`
+        "#],
+    );
+}
+
+#[test]
+fn test_slice_cbytes_builtin() {
+    assert_lowers_to(
+        r#"
+        const basic = @slice_cbytes("hello", 1, 3) == "el";
+        const len_of_slice = @slice_cbytes("hello", 1, 4).length;
+        const nested = @slice_cbytes(@slice_cbytes("hello", 1, 4), 1, 2) == "l";
+        const full = @slice_cbytes("hello", 0, 5) == "hello";
+        const empty = @slice_cbytes("hello", 2, 2) == "";
+        init {
+            let mut a: bool = basic;
+            let mut b: u256 = len_of_slice;
+            let mut c: bool = nested;
+            let mut d: bool = full;
+            let mut e: bool = empty;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : bool = true
+            %1 : u256 = 3
+            %2 : bool = true
+            %3 : bool = true
+            %4 : bool = true
+            %5 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_slice_cbytes_start_after_end() {
+    assert_diagnostics(
+        r#"
+        const bad = @slice_cbytes("hello", 3, 1);
+        init {
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: bytes slice out of bounds
+         --> main.plk:1:13
+          |
+        1 | const bad = @slice_cbytes("hello", 3, 1);
+          |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ requested range 3..1 of bytes with length 5
+          |
+          = note: requires `start <= end` and `end <= bytes.length`
+        "#],
+    );
+}
+
+#[test]
+fn test_slice_cbytes_end_past_len() {
+    assert_diagnostics(
+        r#"
+        const bad = @slice_cbytes("hello", 2, 6);
+        init {
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: bytes slice out of bounds
+         --> main.plk:1:13
+          |
+        1 | const bad = @slice_cbytes("hello", 2, 6);
+          |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ requested range 2..6 of bytes with length 5
+          |
+          = note: requires `start <= end` and `end <= bytes.length`
+        "#],
+    );
+}
+
+#[test]
+fn test_slice_cbytes_runtime_bound() {
+    assert_diagnostics(
+        r#"
+        init {
+            let n = @evm_calldataload(0);
+            let s = @slice_cbytes("hello", n, 3);
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: expected comptime argument
+         --> main.plk:3:13
+          |
+        3 |     let s = @slice_cbytes("hello", n, 3);
+          |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `@slice_cbytes` requires slice start to be known at comptime
+        "#],
+    );
+}
+
+#[test]
+fn test_data_offset_of_slice_cbytes() {
+    assert_lowers_to(
+        r#"
+        init {
+            let offset = @data_offset(@slice_cbytes("hello" hex"00ff", 2, 6));
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = data_offset(hex"68656c6c6f00ff") + 2
+            %1 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_keccak256_cbytes_builtin() {
+    assert_eq!(
+        alloy_primitives::keccak256(b"abc"),
+        alloy_primitives::b256!(
+            "0x4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
+        ),
+    );
+    assert_eq!(
+        alloy_primitives::keccak256(b""),
+        alloy_primitives::b256!(
+            "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        ),
+    );
+    assert_lowers_to(
+        r#"
+        const abc_hash_matches = @keccak256_cbytes("abc")
+            == 0x4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45;
+        const empty_hash_matches = @keccak256_cbytes("")
+            == 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470;
+        init {
+            let mut a: bool = abc_hash_matches;
+            let mut b: bool = empty_hash_matches;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : bool = true
+            %1 : bool = true
+            %2 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_keccak256_cbytes_of_slice() {
+    assert_eq!(
+        alloy_primitives::keccak256(b"ell"),
+        alloy_primitives::b256!(
+            "0x0dd666b403ddf2d5833ea7c8306cfc8d62ee1052f2da09d8c290aac4d3085b43"
+        ),
+    );
+    assert_lowers_to(
+        r#"
+        const ell_hash_matches = @keccak256_cbytes(@slice_cbytes("hello", 1, 4))
+            == 0x0dd666b403ddf2d5833ea7c8306cfc8d62ee1052f2da09d8c290aac4d3085b43;
+        init {
+            let mut a: bool = ell_hash_matches;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : bool = true
+            %1 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_data_offset_runtime() {
+    assert_lowers_to(
+        r#"
+        init {
+            let offset = @data_offset("hi" hex"00ff");
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = data_offset(hex"686900ff")
+            %1 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_data_offset_in_comptime() {
+    assert_diagnostics(
+        r#"
+        const offset = @data_offset("hello");
+        init {
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: builtin `@data_offset` not supported at compile time
+         --> main.plk:1:16
+          |
+        1 | const offset = @data_offset("hello");
+          |                ^^^^^^^^^^^^^^^^^^^^^ `@data_offset` produces a runtime-only value and cannot be evaluated at compile time
         "#],
     );
 }

@@ -9,13 +9,26 @@ fn try_lower(source: &str) -> (sir_data::EthIRProgram, Session) {
     let mut values = ValueInterner::new();
     let hir = plank_hir::lower(&project, &mut values, &mut session);
     let mir = plank_hir_eval::evaluate(&hir, project.core_ops_source, &mut values, &mut session);
-    let sir = crate::lower(&mir, &values);
+    let sir = crate::lower(&mir, &values, &session);
     (sir, session)
 }
 
 #[track_caller]
 fn assert_lowers_to(source: &str, expected: &str) {
-    let (program, _session) = try_lower(source);
+    let (program, session) = try_lower(source);
+    if session.has_errors() {
+        let rendered = session
+            .diagnostics()
+            .iter()
+            .map(|d| d.render_plain(&session))
+            .collect::<Vec<_>>()
+            .join("\n----\n");
+        panic!(
+            "###### Lowering Failed With Diagnostics ({}) ######\n\n{}",
+            session.diagnostics().len(),
+            rendered
+        );
+    }
     let actual = sir_data::display_program(&program);
     let expected = plank_test_utils::dedent_preserve_blank_lines(expected);
     pretty_assertions::assert_str_eq!(actual.trim(), expected.trim());
@@ -743,6 +756,99 @@ fn test_uninit_primitives() {
                 $4 = copy $3
                 stop
             }
+        "#,
+    );
+}
+
+#[test]
+fn test_data_offset_lowers_to_data_segment() {
+    assert_lowers_to(
+        r#"
+        init {
+            let offset = @data_offset("hello");
+            @evm_stop();
+        }
+        "#,
+        r#"
+        Init: @0
+        Functions:
+            fn @0 -> entry @0  (outputs: 0)
+
+        Basic Blocks:
+            @0 {
+                $1 = data_offset .0
+                $2 = const 0x0
+                $0 = add $1 $2
+                stop
+            }
+
+
+        data .0 0x68656c6c6f
+        "#,
+    );
+}
+
+#[test]
+fn test_data_offset_dedups_identical_literals() {
+    assert_lowers_to(
+        r#"
+        init {
+            let first = @data_offset("hello");
+            let second = @data_offset("hello");
+            let other = @data_offset(hex"00ff");
+            @evm_stop();
+        }
+        "#,
+        r#"
+        Init: @0
+        Functions:
+            fn @0 -> entry @0  (outputs: 0)
+
+        Basic Blocks:
+            @0 {
+                $1 = data_offset .0
+                $2 = const 0x0
+                $0 = add $1 $2
+                $4 = data_offset .0
+                $5 = const 0x0
+                $3 = add $4 $5
+                $7 = data_offset .1
+                $8 = const 0x0
+                $6 = add $7 $8
+                stop
+            }
+
+
+        data .0 0x68656c6c6f
+        data .1 0x00ff
+        "#,
+    );
+}
+
+#[test]
+fn test_data_offset_of_slice_cbytes_adds_start_offset() {
+    assert_lowers_to(
+        r#"
+        init {
+            let offset = @data_offset(@slice_cbytes("hello" hex"00ff", 2, 6));
+            @evm_stop();
+        }
+        "#,
+        r#"
+        Init: @0
+        Functions:
+            fn @0 -> entry @0  (outputs: 0)
+
+        Basic Blocks:
+            @0 {
+                $1 = data_offset .0
+                $2 = const 0x2
+                $0 = add $1 $2
+                stop
+            }
+
+
+        data .0 0x68656c6c6f00ff
         "#,
     );
 }

@@ -3,6 +3,7 @@ import std::membytes::{membytes, membytes_new, membytes_from_ptr};
 import std::abi_helpers::{unsafe_abi_encode_to, unsafe_abi_decode_from, abi_buf_fits, is_abi_dynamic, abi_head_size};
 import std::math::ceil32;
 import std::utils::fold;
+import std::regions::keccak256;
 
 // Accumulator for computing ABI encoded size of a struct via fold.
 // Runtime value (encoded_value) cannot be captured in closures,
@@ -27,7 +28,7 @@ const abi_encoded_size = fn (value: $T) u256 {
     } else if T == bool {
         32
     } else if T == membytes {
-        32 + ceil32(value.len)
+        32 + ceil32(value.length)
     } else if @is_struct(T) {
         // Start from the head size; non-dynamic fields are already accounted for.
         let initial = AbiSizeAccumulator(T) {
@@ -48,8 +49,7 @@ const abi_encoded_size = fn (value: $T) u256 {
         );
         result.total_size
     } else {
-        let _sizeof_unsupported_type: u256 = true;
-        0
+        @compile_error("unsupported type for ABI encoding")
     }
 };
 
@@ -63,7 +63,7 @@ const unsafe_abi_encode = fn (ptr: memptr, value: $T) u256 {
 // or None if the buffer is too small to hold the encoding.
 const abi_encode_try = fn (buf: membytes, value: $T) Option(u256) {
     let size = abi_encoded_size(value);
-    if size > buf.len {
+    if size > buf.length {
         return None(u256);
     }
     Some(unsafe_abi_encode_to(buf.ptr, 0, value))
@@ -79,7 +79,7 @@ const abi_encode = fn (value: $T) membytes {
 
 // Decodes a value of type T from raw memory. Caller must ensure
 // the region contains valid ABI-encoded data.
-const unsafe_abi_decode = fn (comptime T: type, ptr: memptr, len: u256) T {
+const unsafe_abi_decode = fn (comptime T: type, ptr: memptr, length: u256) T {
     unsafe_abi_decode_from(T, ptr, 0)
 };
 
@@ -96,4 +96,9 @@ const abi_decode_try = fn (comptime T: type, buf: membytes) Option(T) {
 // is too small to hold the encoding.
 const abi_decode = fn (comptime T: type, buf: membytes) T {
     unwrap(T, abi_decode_try(T, buf))
+};
+
+const compute_selector = fn (signature: $T) u256 {
+    let hash = keccak256(signature);
+    return hash.raw >> 224;
 };

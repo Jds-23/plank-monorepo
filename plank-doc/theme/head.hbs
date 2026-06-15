@@ -17,8 +17,8 @@ html.dark .hljs-function { color: #ffb454; }
       name: 'plank',
       case_insensitive: false,
       keywords: {
-        keyword: 'as comptime const else fn if import init inline let mut return run struct while',
-        type: 'void u256 bool memptr type function never',
+        keyword: 'as comptime const else fn if import init inline let mut return run struct while hex',
+        type: 'void u256 bool memptr type function never bytes cbytes code memory calldata',
         literal: 'true false'
       },
       contains: [
@@ -26,7 +26,7 @@ html.dark .hljs-function { color: #ffb454; }
         hljs.C_BLOCK_COMMENT_MODE,
         {
           className: 'type',
-          begin: /\b(?:void|u256|bool|memptr|type|function|never)\b/
+          begin: /\b(?:void|u256|bool|memptr|type|function|never|bytes|cbytes|code|memory|calldata)\b/
         },
         {
           className: 'number',
@@ -58,7 +58,7 @@ html.dark .hljs-function { color: #ffb454; }
         },
         {
           className: 'string',
-          begin: /"[^"]*"/,
+          begin: /"(\\.|[^"\\])*"/,
           relevance: 0
         },
         {
@@ -69,11 +69,6 @@ html.dark .hljs-function { color: #ffb454; }
         {
           className: 'symbol',
           begin: /\b[A-Z][A-Z0-9_]{2,}\b/
-        },
-        {
-          className: 'variable',
-          begin: /\b[a-z_][a-z0-9_]*\s*(?==)/,
-          relevance: 0
         },
         {
           className: 'type',

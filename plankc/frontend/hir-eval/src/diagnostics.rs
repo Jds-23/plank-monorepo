@@ -175,6 +175,17 @@ impl DiagCtx<'_> {
         diag.emit(self);
     }
 
+    pub fn emit_cbytes_unknown_attribute(&mut self, member: StrId, loc: SrcLoc) {
+        Diagnostic::error("unknown cbytes attribute")
+            .primary(
+                loc.source,
+                loc.span,
+                format!("`cbytes` has no attribute `{}`", self.session.lookup_name(member)),
+            )
+            .help(format!("available attribute: `.{}`", builtin_names::LENGTH))
+            .emit(self);
+    }
+
     pub fn emit_not_callable(&mut self, ty: TypeId, loc: BindingLoc) {
         let primary_label = format!("`{}` is not callable", self.types.format(self.session, ty));
         let diag = Diagnostic::error("expected function");
@@ -476,6 +487,25 @@ impl DiagCtx<'_> {
             .emit(self);
     }
 
+    pub fn emit_custom_comptime_error(&mut self, message: impl Into<String>, loc: SrcLoc) {
+        Diagnostic::error(message)
+            .primary(loc.source, loc.span, "custom compile error triggered here")
+            .emit(self);
+    }
+
+    pub fn emit_data_offset_in_comptime(&mut self, loc: SrcLoc) {
+        Diagnostic::error(format!(
+            "builtin `{}` not supported at compile time",
+            builtin_names::DATA_OFFSET
+        ))
+        .primary(
+            loc.source,
+            loc.span,
+            "`@data_offset` produces a runtime-only value and cannot be evaluated at compile time",
+        )
+        .emit(self);
+    }
+
     pub fn emit_struct_lit_unexpected_field(
         &mut self,
         struct_ty: TypeId,
@@ -618,6 +648,23 @@ impl DiagCtx<'_> {
             .emit(self);
     }
 
+    pub fn emit_bytes_slice_out_of_bounds(
+        &mut self,
+        start: U256,
+        end: U256,
+        len: u32,
+        loc: SrcLoc,
+    ) {
+        Diagnostic::error("bytes slice out of bounds")
+            .primary(
+                loc.source,
+                loc.span,
+                format!("requested range {start}..{end} of bytes with length {len}"),
+            )
+            .note("requires `start <= end` and `end <= bytes.length`")
+            .emit(self);
+    }
+
     pub fn emit_expected_comptime_arg(&mut self, builtin: Builtin, arg_name: &str, loc: SrcLoc) {
         Diagnostic::error("expected comptime argument")
             .primary(
@@ -690,7 +737,7 @@ impl DiagCtx<'_> {
     fn uninit_help() -> String {
         use builtin_names::*;
         format!(
-            "{UNINIT} only supports {U256}, {BOOL}, {VOID}, {TYPE}, {MEMORY_POINTER} and struct types",
+            "{UNINIT} only supports {U256}, {BOOL}, {VOID}, {TYPE}, {CBYTES}, {MEMORY_POINTER} and struct types",
         )
     }
 

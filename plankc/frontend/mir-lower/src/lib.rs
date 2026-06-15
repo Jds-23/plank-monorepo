@@ -5,11 +5,12 @@ mod tests;
 
 use plank_core::{DenseIndexMap, Idx};
 use plank_mir::{self as mir, Expr, Instruction, Mir};
+use plank_session::{BytesId, Session};
 use plank_values::{PrimitiveType, Type, TypeId, Value, ValueId, ValueInterner};
 use sir_data::{
     self as sir, Branch, Control, EthIRProgram, Operation,
     builder::{BasicBlockBuilder, EthIRBuilder, FunctionBuilder},
-    operation::{InlineOperands, OpExtraData, OperationKind, SetSmallConstData},
+    operation::{InlineOperands, OpExtraData, OperationKind, SetDataOffsetData, SetSmallConstData},
 };
 use std::collections::{HashMap, hash_map::Entry};
 
@@ -57,9 +58,12 @@ impl LocalMap {
 
 struct LowerCtx<'a> {
     mir: &'a Mir,
+    session: &'a Session,
 
     mir_to_sir_functions: DenseIndexMap<mir::FnId, sir::FunctionId>,
     locals_map: LocalMap,
+    /// One data segment per unique interned bytes value, shared program-wide.
+    data_segments: HashMap<BytesId, sir::DataId>,
 
     locals_buf: Vec<sir::LocalId>,
 }
@@ -71,7 +75,9 @@ impl LowerCtx<'_> {
                 PrimitiveType::Void | PrimitiveType::Never => 0,
                 PrimitiveType::Bool | PrimitiveType::U256 | PrimitiveType::MemoryPointer => 1,
                 PrimitiveType::Function => unreachable!("function unsizeable in SIR"),
-                PrimitiveType::Type => unreachable!("PrimitiveType unsizeable in SIR"),
+                PrimitiveType::Type | PrimitiveType::CBytes => {
+                    unreachable!("comptime-only primitive unsizeable in SIR")
+                }
             },
             Type::Struct(r#struct) => {
                 r#struct.fields.iter().map(|&field| self.size_in_locals(field.ty)).sum()
@@ -80,14 +86,16 @@ impl LowerCtx<'_> {
     }
 }
 
-pub fn lower(mir: &Mir, values: &ValueInterner) -> EthIRProgram {
+pub fn lower(mir: &Mir, values: &ValueInterner, session: &Session) -> EthIRProgram {
     let mut builder = EthIRBuilder::new();
 
     let mut ctx = LowerCtx {
         mir,
+        session,
 
         mir_to_sir_functions: DenseIndexMap::with_capacity(mir.fns.len()),
         locals_map: LocalMap::new(),
+        data_segments: HashMap::new(),
 
         locals_buf: Vec::new(),
     };
@@ -188,7 +196,7 @@ fn lower_basic_block(
                             fields,
                         )
                     }
-                    Value::Type(_) | Value::Closure { .. } => {
+                    Value::Type(_) | Value::Bytes(_) | Value::Closure { .. } => {
                         unreachable!("comptime-only value in MIR")
                     }
                 },
@@ -271,6 +279,28 @@ fn lower_basic_block(
                 }
                 Expr::FieldAccess { object, field_index } => {
                     lower_field_access(ctx, &mut current_bb, target, mir_func, object, field_index);
+                }
+                Expr::DataOffset { contents, start } => {
+                    let session = ctx.session;
+                    let segment_id = *ctx.data_segments.entry(contents).or_insert_with(|| {
+                        current_bb.as_mut().push_data_bytes(session.lookup_bytes(contents))
+                    });
+                    let sets =
+                        ctx.locals_map.get_or_create_single(target, || current_bb.new_local());
+                    let base = current_bb.new_local();
+                    let offset = current_bb.new_local();
+                    current_bb.add_operation(Operation::SetDataOffset(SetDataOffsetData {
+                        sets: base,
+                        segment_id,
+                    }));
+                    current_bb.add_operation(Operation::SetSmallConst(SetSmallConstData {
+                        sets: offset,
+                        value: start,
+                    }));
+                    current_bb.add_operation(Operation::Add(InlineOperands {
+                        ins: [base, offset],
+                        outs: [sets],
+                    }));
                 }
             },
             Instruction::Return(local) => {
@@ -396,7 +426,7 @@ fn materialize_constant_struct_literal(
             Value::StructVal { ty: _, fields } => {
                 materialize_constant_struct_literal(values, bb, targets, fields);
             }
-            Value::Type(_) | Value::Closure { .. } => {
+            Value::Type(_) | Value::Bytes(_) | Value::Closure { .. } => {
                 unreachable!("MIR: comptime-only value")
             }
         }

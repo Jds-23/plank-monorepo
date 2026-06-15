@@ -76,6 +76,199 @@ fn test_lexer_error_malformed_ident() {
 }
 
 #[test]
+fn test_lexer_error_unclosed_string() {
+    assert_parser_errors(
+        r#"
+            const x = "unterminated
+        "#,
+        &[
+            r#"
+            error: unclosed string segment
+             --> test.plk:1:11
+              |
+            1 | const x = "unterminated
+              |           ^^^^^^^^^^^^^ missing closing `"`
+            "#,
+            r#"
+            error: unexpected EOF
+             --> test.plk:1:24
+              |
+            1 | const x = "unterminated
+              |                        ^ unexpected EOF, expected `;`
+            "#,
+        ],
+    );
+}
+
+#[test]
+fn test_lexer_error_malformed_hex_string() {
+    assert_parser_errors(
+        r#"
+            const x = hex"0fg";
+        "#,
+        &[
+            r#"
+            error: invalid digit in hex string literal
+             --> test.plk:1:17
+              |
+            1 | const x = hex"0fg";
+              |                 ^ `g` is not a hex digit (0-9, a-f, A-F)
+            "#,
+            r#"
+            error: odd number of digits in hex string literal
+             --> test.plk:1:11
+              |
+            1 | const x = hex"0fg";
+              |           ^^^^^^^^ expected an even number of hex digits
+              |
+              = help: hex string literals encode whole bytes, so two hex digits are needed per byte
+            "#,
+        ],
+    );
+}
+
+#[test]
+fn test_string_unrecognized_escape() {
+    assert_parser_errors(
+        r#"
+            const x = "bad \q escape";
+        "#,
+        &[r#"
+            error: unrecognized escape sequence
+             --> test.plk:1:16
+              |
+            1 | const x = "bad \q escape";
+              |                ^^ `\q` is not a recognized escape sequence
+              |
+              = help: valid escapes are `\n`, `\r`, `\t`, `\0`, `\\`, `\"` and `\xHH`
+            "#],
+    );
+}
+
+#[test]
+fn test_string_invalid_hex_escape() {
+    assert_parser_errors(
+        r#"
+            const x = "short \x1";
+        "#,
+        &[r#"
+            error: invalid hex escape
+             --> test.plk:1:18
+              |
+            1 | const x = "short \x1";
+              |                  ^^^ `\x` must be followed by exactly two hex digits, e.g. `\x7f`
+            "#],
+    );
+}
+
+#[test]
+fn test_hex_string_odd_digit_count() {
+    assert_parser_errors(
+        r#"
+            const x = hex"012";
+        "#,
+        &[r#"
+            error: odd number of digits in hex string literal
+             --> test.plk:1:11
+              |
+            1 | const x = hex"012";
+              |           ^^^^^^^^ expected an even number of hex digits
+              |
+              = help: hex string literals encode whole bytes, so two hex digits are needed per byte
+            "#],
+    );
+}
+
+#[test]
+fn multiline_string_suggestion() {
+    assert_parser_errors(
+        r#"
+        const S = "wow this is nice
+        another line \x34
+        asdfsdf asdfaf";
+
+        "#,
+        &[r#"
+        error: malformed string segment
+         --> test.plk:1:11
+          |
+        1 |   const S = "wow this is nice
+          |  ___________^
+        2 | | another line \x34
+        3 | | asdfsdf asdfaf";
+          | |_______________^ newlines may not be added directly, only with `\n`
+          |
+        help: multiline strings can be created using segments
+          |
+        1 ~ const S = 
+        2 +     "wow this is nice\n"
+        3 +     "another line \x34\n"
+        4 ~     "asdfsdf asdfaf";
+          |
+        "#],
+    );
+
+    assert_parser_errors(
+        r#"
+        const S = "line1 abcdef
+            gabagooooo \x34
+        ";
+
+        "#,
+        &[r#"
+        error: malformed string segment
+         --> test.plk:1:11
+          |
+        1 |   const S = "line1 abcdef
+          |  ___________^
+        2 | |     gabagooooo \x34
+        3 | | ";
+          | |_^ newlines may not be added directly, only with `\n`
+          |
+        help: multiline strings can be created using segments
+          |
+        1 ~ const S = 
+        2 +     "line1 abcdef\n"
+        3 ~     "    gabagooooo \x34\n";
+          |
+        "#],
+    );
+}
+
+#[test]
+fn unicode_in_string() {
+    assert_parser_errors(
+        r#"
+        const PROVERB = "pretty cool huh? LLMs can do chinese: 你在人生中最中国的时刻遇见了我, anyways.";
+
+        const BAKED_GOOD = "Gebäck";
+        "#,
+        &[
+            r#"
+        error: non-ASCII characters in string segment
+         --> test.plk:1:56
+          |
+        1 - const PROVERB = "pretty cool huh? LLMs can do chinese: 你在人生中最中国的时刻遇见了我, anyways.";
+        1 + const PROVERB = "pretty cool huh? LLMs can do chinese: " hex"e4bda0e59ca8e4babae7949fe4b8ade69c80e4b8ade59bbde79a84e697b6e588bbe98187e8a781e4ba86e68891" ", anyways.";
+          |
+          = help: to add unicode characters embed the UTF-8 encoded bytes
+          = info: unicode characters are disallowed for auditability because they can introduce homoglyphs/confusables or bidirectional text-flow controls
+        "#,
+            r#"
+        error: non-ASCII characters in string segment
+         --> test.plk:2:24
+          |
+        2 - const BAKED_GOOD = "Gebäck";
+        2 + const BAKED_GOOD = "Geb" hex"c3a4" "ck";
+          |
+          = help: to add unicode characters embed the UTF-8 encoded bytes
+          = info: unicode characters are disallowed for auditability because they can introduce homoglyphs/confusables or bidirectional text-flow controls
+        "#,
+        ],
+    );
+}
+
+#[test]
 fn test_lexer_error_unclosed_block_comment() {
     assert_parser_errors(
         r#"
@@ -103,8 +296,8 @@ fn test_lexer_error_nested_unclosed_block_comment() {
              --> test.plk:1:1
               |
             1 | / /* no end /* wait but I closed ?
-            2 | | */
-              | |__^ missing closing `*/`
+            2 | |  */
+              | |___^ missing closing `*/`
               |
               = help: plank supports nested block comments so each `/*` needs its own `*/`
         "#],

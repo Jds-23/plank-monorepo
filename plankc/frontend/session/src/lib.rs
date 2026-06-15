@@ -1,16 +1,18 @@
 pub mod builtins;
 pub mod diagnostic;
+mod interner;
 pub mod poison;
 
 pub use builtins::{Builtin, RuntimeBuiltin};
 pub use diagnostic::*;
+pub use interner::{BytesId, EMPTY_BYTES, StrId};
 pub use poison::{MaybePoisoned, Poisoned};
 
-use plank_core::{Idx, IndexVec, Span, intern::StringInterner, newtype_index};
+use interner::Interner;
+use plank_core::{Idx, IndexVec, Span, newtype_index};
 use std::path::PathBuf;
 
 newtype_index! {
-    pub struct StrId;
     pub struct SourceId;
     pub struct SourceByteOffset;
 }
@@ -29,7 +31,7 @@ pub struct Source {
 }
 
 pub struct Session {
-    name_interner: StringInterner<StrId>,
+    interner: Interner,
     source_map: IndexVec<SourceId, Source>,
     total_errors: u32,
     diagnostics: Vec<Diagnostic>,
@@ -38,7 +40,7 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         let mut this = Self {
-            name_interner: StringInterner::new(),
+            interner: Interner::new(),
             source_map: IndexVec::new(),
             total_errors: 0,
             diagnostics: Vec::new(),
@@ -52,16 +54,34 @@ impl Session {
     }
 
     pub fn intern(&mut self, name: &str) -> StrId {
-        self.name_interner.intern(name)
+        self.interner.intern_str(name)
     }
 
     pub fn lookup_name(&self, name: StrId) -> &str {
-        &self.name_interner[name]
+        // Safety: a session owns exactly one interner; every `StrId` handled
+        // by a session originates from it.
+        unsafe { self.interner.lookup_str(name) }
     }
 
     pub fn lookup_name_spanned(&self, name: StrId, start: SourceByteOffset) -> (&str, SourceSpan) {
-        let name = &self.name_interner[name];
+        let name = self.lookup_name(name);
         (name, Span::new(start, start + name.len() as u32))
+    }
+
+    pub fn intern_bytes(&mut self, bytes: &[u8]) -> BytesId {
+        self.interner.intern_bytes(bytes)
+    }
+
+    pub fn lookup_bytes(&self, bytes: BytesId) -> &[u8] {
+        self.interner.lookup_bytes(bytes)
+    }
+
+    pub fn lookup_bytes_slice(&self, bytes: BytesId, start: u32, end: u32) -> &[u8] {
+        &self.lookup_bytes(bytes)[start as usize..end as usize]
+    }
+
+    pub fn lookup_bytes_lossy(&self, bytes: BytesId, start: u32, end: u32) -> String {
+        String::from_utf8_lossy(self.lookup_bytes_slice(bytes, start, end)).into_owned()
     }
 
     pub fn next_source(&self) -> SourceId {
@@ -82,10 +102,6 @@ impl Session {
 
     pub fn has_errors(&self) -> bool {
         self.total_errors() > 0
-    }
-
-    pub fn interner(&self) -> &plank_core::intern::StringInterner<StrId> {
-        &self.name_interner
     }
 
     /// Both line and col are 1-indexed. O(n) linear scan.
