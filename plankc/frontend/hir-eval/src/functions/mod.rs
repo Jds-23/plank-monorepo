@@ -1,8 +1,8 @@
 use plank_core::{DenseIndexMap, IndexVec};
 use plank_hir::{self as hir, ValueId};
 use plank_mir as mir;
-use plank_session::{MaybePoisoned, Poisoned, SourceId, SourceSpan, SrcLoc, poison};
-use plank_values::{DefOrigin, TypeId, Value};
+use plank_session::{MaybePoisoned, Poisoned, SourceId, SourceSpan, SrcLoc, StrId, poison};
+use plank_values::{DefOrigin, Type, TypeId, Value};
 
 mod cache;
 
@@ -37,6 +37,7 @@ struct Call<'a> {
     caller_bindings: &'a DenseIndexMap<hir::LocalId, Local>,
     caller_mir_types: &'a mut IndexVec<mir::LocalId, TypeId>,
     span: SourceSpan,
+    type_name: Option<StrId>,
 
     closure: ValueId,
     func: hir::FnDef,
@@ -61,6 +62,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         args: &'s [hir::LocalId],
         arg_spans: CallArgSpansIdx,
         call_span: SourceSpan,
+        type_name: Option<StrId>,
         capture_buf_offset: usize,
         validated: ArgParamComptimenessMatch,
     ) -> (Scope<'s, 'ctx>, Call<'s>, &'s mut ComptimeQuota, &'s mut u32) {
@@ -146,6 +148,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             caller_bindings,
             caller_mir_types,
             span: call_span,
+            type_name,
             closure,
             func: fn_def,
             args,
@@ -205,8 +208,12 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             }
             let capture_values = &this.eval.captures_buf[captures_buf_offset..];
             assert_eq!(capture_values.len(), def_captures.len());
-            let closure_value =
-                this.eval.values.intern(Value::Closure { fn_def: id, captures: capture_values });
+            let fn_def = this.eval.hir.fns[id];
+            let closure_value = this.eval.values.intern(Value::Closure {
+                fn_def: id,
+                def_loc: fn_def.loc(fn_def.source_span),
+                captures: capture_values,
+            });
             Ok(EvalValue::Comptime(closure_value))
         })
     }
@@ -227,17 +234,21 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                         return Err(Poisoned);
                     }
                 };
-                let Value::Closure { fn_def: fn_def_id, captures } =
+                let Value::Closure { fn_def: fn_def_id, captures, .. } =
                     this.eval.values.lookup(closure_vid)
                 else {
                     let ty = this.values.type_of_value(closure_vid);
-                    this.diag_ctx
-                        .emit_not_callable(ty, this.binding_loc(callee_use_span, callee_origin));
+                    this.diag_ctx.emit_not_callable(
+                        this.eval.values,
+                        ty,
+                        this.binding_loc(callee_use_span, callee_origin),
+                    );
                     return Err(Poisoned);
                 };
                 for &capture in captures {
                     this.eval.captures_buf.push(capture);
                 }
+                let type_name = this.values.get_closure_name(closure_vid);
 
                 let args = &this.hir.call_args[args_id];
                 let arg_spans = this
@@ -250,6 +261,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                     args,
                     arg_spans,
                     call_span,
+                    type_name,
                     capture_buf_offset,
                     values_buf_offset,
                 );
@@ -289,6 +301,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         args: &[hir::LocalId],
         arg_spans: CallArgSpansIdx,
         call_span: SourceSpan,
+        type_name: Option<StrId>,
         capture_buf_offset: usize,
         values_buf_offset: usize,
     ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
@@ -315,6 +328,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 args,
                 arg_spans,
                 call_span,
+                type_name,
                 capture_buf_offset,
                 validated,
             );
@@ -625,6 +639,9 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             Err(Diverge::BlockEnd(None)) => Ok(Err(Diverge::END)),
             Err(Diverge::BlockEnd(Some(ret_value))) => Ok(Ok(ret_value)),
         };
+        if let (Some(type_name), Ok(Ok(value))) = (call.type_name, eval_res) {
+            self.try_name_anonymous_call_result_type(type_name, call, value, values_buf_offset);
+        }
         let outcome = match eval_res {
             Ok(Ok(value)) => ComptimeCallOutcome::Value(value),
             Err(Poisoned) => {
@@ -651,6 +668,48 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         };
         cache_state.set(EvaluatedFnState::Done(Ok(result)));
         Ok(Ok(result))
+    }
+
+    fn try_name_anonymous_call_result_type(
+        &mut self,
+        name: StrId,
+        call: &Call<'_>,
+        value: ValueId,
+        values_buf_offset: usize,
+    ) {
+        let Value::Type(ty) = self.values.lookup(value) else {
+            return;
+        };
+        let Type::Struct(r#struct) = self.types.lookup(ty) else {
+            return;
+        };
+        if r#struct.name.get().is_some() {
+            return;
+        }
+        let Ok(body_span) = self.hir.block_spans[call.func.body] else {
+            return;
+        };
+        if r#struct.def_loc.source != call.func.source
+            || !body_span.range().contains(&r#struct.def_loc.span.start)
+        {
+            return;
+        }
+
+        let args_offset = self.eval.type_name_args_buf.len();
+        let args_end = self.eval.maybe_values_buf.len();
+        for idx in values_buf_offset..args_end {
+            let Ok(value) = self.eval.maybe_values_buf[idx] else {
+                self.eval.type_name_args_buf.truncate(args_offset);
+                return;
+            };
+            self.eval.type_name_args_buf.push(value);
+        }
+        self.types.try_name_struct_parameterized(
+            ty,
+            name,
+            &self.eval.type_name_args_buf[args_offset..],
+        );
+        self.eval.type_name_args_buf.truncate(args_offset);
     }
 
     pub fn eval_param(
@@ -682,6 +741,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 let arg_ty = self.state_type(state);
                 if !arg_ty.is_assignable_to(param_ty) {
                     self.diag_ctx.emit_type_mismatch(
+                        self.eval.values,
                         param_ty,
                         self.origin_loc(self.bindings[local_id].origin),
                         arg_ty,
@@ -735,6 +795,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             let ty = self.value_type(value);
             if !ty.is_assignable_to(return_type) {
                 self.diag_ctx.emit_type_mismatch(
+                    self.eval.values,
                     return_type,
                     ret_type_loc,
                     ty,

@@ -4,7 +4,9 @@ use plank_core::{
 use plank_hir::{self as hir, ConstId, Hir};
 use plank_mir as mir;
 use plank_session::{MaybePoisoned, Poisoned, SourceSpan, SrcLoc, StrId, ZERO_SPAN};
-use plank_values::{DefOrigin, Field, Type, TypeId, TypeInterner, Value, ValueId, ValueInterner};
+use plank_values::{
+    DefOrigin, Field, Type, TypeId, TypeInterner, TypeName, Value, ValueId, ValueInterner,
+};
 
 use crate::{
     diagnostics::DiagCtx,
@@ -63,6 +65,7 @@ pub(crate) struct Evaluator<'a> {
     pub locals_buf: Vec<mir::LocalId>,
     pub values_buf: Vec<ValueId>,
     pub maybe_values_buf: Vec<MaybePoisoned<ValueId>>,
+    pub type_name_args_buf: Vec<ValueId>,
     pub fields_buf: Vec<Field>,
     pub captures_buf: Vec<(ValueId, DefOrigin)>,
 }
@@ -97,6 +100,7 @@ impl<'a> Evaluator<'a> {
             locals_buf: Vec::new(),
             values_buf: Vec::new(),
             maybe_values_buf: Vec::new(),
+            type_name_args_buf: Vec::new(),
             fields_buf: Vec::new(),
             captures_buf: Vec::new(),
         }
@@ -171,14 +175,20 @@ impl<'a> Evaluator<'a> {
     }
 
     fn try_name_type(&mut self, name: StrId, value: MaybePoisoned<ValueId>) {
-        let Ok(Value::Type(ty)) = value.map(|vid| self.values.lookup(vid)) else {
-            return;
-        };
-        let Type::Struct(r#struct) = self.types.lookup(ty) else {
-            return;
-        };
-        if r#struct.name.get().is_none() {
-            r#struct.name.set(Some(name));
+        let Ok(value) = value else { return };
+        match self.values.lookup(value) {
+            Value::Type(ty) => {
+                let Type::Struct(r#struct) = self.types.lookup(ty) else {
+                    return;
+                };
+                if r#struct.name.get().is_none() {
+                    r#struct.name.set(Some(TypeName::Plain(name)));
+                }
+            }
+            Value::Closure { .. } => {
+                self.values.try_name_closure(value, name);
+            }
+            _ => {}
         }
     }
 

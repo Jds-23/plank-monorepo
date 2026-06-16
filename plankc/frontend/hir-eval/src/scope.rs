@@ -181,7 +181,11 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         };
         let Value::Type(ty) = self.values.lookup(vid) else {
             let actual_ty = self.values.type_of_value(vid);
-            self.diag_ctx.emit_type_not_type(actual_ty, self.binding_loc(use_span, origin));
+            self.diag_ctx.emit_type_not_type(
+                self.eval.values,
+                actual_ty,
+                self.binding_loc(use_span, origin),
+            );
             return Err(Poisoned);
         };
         Ok(ty)
@@ -231,6 +235,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             Ok(())
         } else {
             self.diag_ctx.emit_type_mismatch(
+                self.eval.values,
                 expected_ty,
                 expected_loc,
                 actual_ty,
@@ -350,6 +355,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                         };
                         if let Err(existing_ty) = self.mir_types[target].unify(ty) {
                             self.diag_ctx.emit_incompatible_branch_types(
+                                self.eval.values,
                                 existing_ty,
                                 self.origin_loc(binding.origin),
                                 ty,
@@ -396,6 +402,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             LocalState::Comptime(ValueId::FALSE) => Ok(false),
             LocalState::Comptime(value) => {
                 self.diag_ctx.emit_type_mismatch_simple(
+                    self.eval.values,
                     TypeId::BOOL,
                     self.values.type_of_value(value),
                     self.loc(binding.use_span),
@@ -542,6 +549,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             Ok(state) => {
                 let state_ty = self.state_type(state);
                 self.diag_ctx.emit_type_mismatch_simple(
+                    self.eval.values,
                     TypeId::BOOL,
                     state_ty,
                     self.loc(binding.use_span),
@@ -581,6 +589,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
             let state_ty = this.state_type(state);
             if !state_ty.is_assignable_to(TypeId::BOOL) {
                 this.diag_ctx.emit_type_mismatch_simple(
+                    this.eval.values,
                     TypeId::BOOL,
                     state_ty,
                     this.loc(binding.use_span),

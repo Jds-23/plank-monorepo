@@ -1,4 +1,4 @@
-use plank_core::chunked_arena::ChunkedArena;
+use plank_core::{chunked_arena::ChunkedArena, list_of_lists::ListOfLists, newtype_index};
 use std::{
     cell::{Cell, UnsafeCell},
     fmt,
@@ -6,10 +6,19 @@ use std::{
     num::NonZero,
 };
 
+use crate::{ValueId, ValueInterner};
 use hashbrown::{DefaultHashBuilder, HashSet, HashTable, hash_table::Entry};
 use plank_session::{Session, SourceSpan, SrcLoc, StrId};
 
-use crate::ValueId;
+newtype_index! {
+    pub struct TypeNameArgsId;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeName {
+    Plain(StrId),
+    Parameterized { name: StrId, args: TypeNameArgsId },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Field {
@@ -21,7 +30,7 @@ pub struct Field {
 struct StructHeader {
     def_loc: SrcLoc,
     type_index: ValueId,
-    name: Cell<Option<StrId>>,
+    name: Cell<Option<TypeName>>,
     total_fields: u32,
 }
 
@@ -37,7 +46,7 @@ const MIN_STRUCT_FIELD_ALIGN: usize = {
 pub struct StructView<'a> {
     pub def_loc: SrcLoc,
     pub type_index: ValueId,
-    pub name: &'a Cell<Option<StrId>>,
+    pub name: &'a Cell<Option<TypeName>>,
     pub fields: &'a [Field],
 }
 
@@ -105,6 +114,7 @@ pub struct TypeInterner {
     dedup: UnsafeCell<HashTable<StructRef>>,
     arena: ChunkedArena<MIN_STRUCT_FIELD_ALIGN>,
     hasher: DefaultHashBuilder,
+    type_name_args: UnsafeCell<ListOfLists<TypeNameArgsId, ValueId>>,
 }
 
 impl Default for TypeInterner {
@@ -224,6 +234,7 @@ impl TypeInterner {
             arena: ChunkedArena::new(),
             dedup: UnsafeCell::new(HashTable::new()),
             hasher: DefaultHashBuilder::default(),
+            type_name_args: UnsafeCell::new(ListOfLists::new()),
         }
     }
 
@@ -281,23 +292,75 @@ impl TypeInterner {
         }
     }
 
-    pub fn fmt_struct(
+    pub fn try_name_struct_parameterized(&self, ty: TypeId, name: StrId, args: &[ValueId]) {
+        let Type::Struct(r#struct) = self.lookup(ty) else {
+            return;
+        };
+        // Deduped structs may be reached through multiple parameterizations; if this
+        // TypeId already has a canonical display name, keep it.
+        if r#struct.name.get().is_some() {
+            return;
+        }
+        let args = self.intern_type_name_args(args);
+        r#struct.name.set(Some(TypeName::Parameterized { name, args }));
+    }
+
+    pub fn intern_type_name_args(&self, args: &[ValueId]) -> TypeNameArgsId {
+        // SAFETY: We only create this mutable reference for the duration of this call. Callers must
+        // not intern type-name args while formatting is holding slices borrowed from this list.
+        unsafe { (*self.type_name_args.get()).push_copy_slice(args) }
+    }
+
+    fn fmt_struct(
         &self,
         f: &mut impl fmt::Write,
         r#struct: StructRef,
         session: &Session,
+        values: &ValueInterner,
     ) -> fmt::Result {
         let view = self.lookup_struct(r#struct);
         if let Some(name) = view.name.get() {
-            return f.write_str(session.lookup_name(name));
+            return match name {
+                TypeName::Plain(str_id) => f.write_str(session.lookup_name(str_id)),
+                TypeName::Parameterized { name, args } => {
+                    f.write_str(session.lookup_name(name))?;
+                    f.write_str("(")?;
+                    self.fmt_type_name_args(f, args, session, values)?;
+                    f.write_str(")")
+                }
+            };
         }
         let (line, col) = session.offset_to_line_col(view.def_loc.source, view.def_loc.span.start);
         let source = &session.get_source(view.def_loc.source);
-        write!(f, "struct#{}@{}:{line}:{col}", r#struct.0, source.path.to_str().unwrap())
+        write!(f, "struct@{}:{line}:{col}", source.path.display())
     }
 
-    pub fn format<'a>(&'a self, sess: &'a Session, ty: TypeId) -> FmtType<'a> {
-        FmtType { types: self, sess, ty }
+    fn fmt_type_name_args(
+        &self,
+        f: &mut impl fmt::Write,
+        args: TypeNameArgsId,
+        session: &Session,
+        values: &ValueInterner,
+    ) -> fmt::Result {
+        // SAFETY: Formatting only reads type-name args and must not call code that can mutate
+        // `type_name_args`; otherwise this borrowed slice could be invalidated by reallocation.
+        let args = unsafe { &(&*self.type_name_args.get())[args] };
+        let mut sep = "";
+        for &arg in args {
+            f.write_str(sep)?;
+            sep = ", ";
+            write!(f, "{}", values.format_value(session, self, arg))?;
+        }
+        Ok(())
+    }
+
+    pub fn format<'a>(
+        &'a self,
+        sess: &'a Session,
+        values: &'a ValueInterner,
+        ty: TypeId,
+    ) -> FmtType<'a> {
+        FmtType { types: self, values, sess, ty }
     }
 
     fn push_struct<'s, 'a>(&'s self, r#struct: StructInfo<'a>) -> StructRef {
@@ -333,6 +396,7 @@ impl TypeInterner {
 
 pub struct FmtType<'a> {
     types: &'a TypeInterner,
+    values: &'a ValueInterner,
     sess: &'a Session,
     ty: TypeId,
 }
@@ -341,7 +405,7 @@ impl std::fmt::Display for FmtType<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.ty.as_primitive() {
             Ok(prim) => write!(f, "{}", prim.name()),
-            Err(r#struct) => self.types.fmt_struct(f, r#struct, self.sess),
+            Err(r#struct) => self.types.fmt_struct(f, r#struct, self.sess, self.values),
         }
     }
 }
