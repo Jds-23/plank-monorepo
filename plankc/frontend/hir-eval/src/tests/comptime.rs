@@ -474,7 +474,7 @@ fn test_comptime_block_struct_type() {
         ==== Functions ====
         ; init
         @fn0() -> never {
-            %0 : struct@main.plk:3:9 = struct#0 {
+            %0 : struct@main.plk:3:9 = struct@main.plk:3:9 {
                 42,
             }
             %1 : never = @evm_stop()
@@ -742,12 +742,12 @@ fn test_comptime_params_monomorphize_uniquely_at_runtime() {
 
         ; init
         @fn2() -> never {
-            %0 : Gen(u256) = struct#0 {
+            %0 : Gen(u256) = Gen(u256) {
                 0,
                 34,
             }
             %1 : u256 = call @fn0(%0)
-            %2 : Gen(bool) = struct#64 {
+            %2 : Gen(bool) = Gen(bool) {
                 false,
                 33,
             }
@@ -892,12 +892,12 @@ fn test_any_type_params_monomorphize_uniquely_at_runtime() {
 
         ; init
         @fn4() -> never {
-            %0 : Gen(u256) = struct#0 {
+            %0 : Gen(u256) = Gen(u256) {
                 0,
                 34,
             }
             %1 : u256 = call @fn0(%0)
-            %2 : Gen(bool) = struct#64 {
+            %2 : Gen(bool) = Gen(bool) {
                 false,
                 33,
             }
@@ -1139,9 +1139,11 @@ fn test_comptime_is_struct() {
         const Pair = struct { a: u256, b: bool };
         const yes = @is_struct(Pair);
         const no = @is_struct(u256);
+        const tuple_no = @is_struct(tuple { u256, bool });
         init {
             let mut x: bool = yes;
             let mut y: bool = no;
+            let mut z: bool = tuple_no;
             @evm_stop();
         }
         "#,
@@ -1151,7 +1153,8 @@ fn test_comptime_is_struct() {
         @fn0() -> never {
             %0 : bool = true
             %1 : bool = false
-            %2 : never = @evm_stop()
+            %2 : bool = false
+            %3 : never = @evm_stop()
         }
         "#,
     );
@@ -1487,7 +1490,7 @@ fn test_set_field_comptime_struct_runtime_value() {
             %0 : u256 = 0
             %1 : u256 = @evm_calldataload(%0)
             %2 : u256 = %1
-            %3 : Pair = struct#0 {
+            %3 : Pair = Pair {
                 1,
                 2,
             }
@@ -1593,7 +1596,7 @@ fn test_uninit_struct_runtime_set_field() {
             %0 : u256 = 0
             %1 : u256 = @evm_calldataload(%0)
             %2 : u256 = %1
-            %3 : Pair = struct#0 {
+            %3 : Pair = Pair {
                 0,
                 0,
             }
@@ -1659,8 +1662,33 @@ fn test_uninit_invalid_type() {
         1 | const x = @uninit(never);
           |           ^^^^^^^^^^^^^^ type 'never' cannot be uninitialized
           |
-          = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
+          = help: @uninit only supports types that do not contain never or function
         "#],
+    );
+}
+
+#[test]
+fn test_uninit_tuple() {
+    assert_lowers_to(
+        r#"
+        const t = @uninit(tuple { u256, bool });
+
+        init {
+            let mut x = t;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : tuple {u256, bool} = tuple {u256, bool} (
+                0,
+                false,
+            )
+            %1 : never = @evm_stop()
+        }
+        "#,
     );
 }
 
@@ -1696,15 +1724,34 @@ fn test_uninit_struct_with_function_field() {
         error: struct contains field that cannot be uninitialized
          --> main.plk:2:11
           |
+        1 | const Bad = struct { a: u256, b: function };
+          |                               ----------- type 'function' cannot be uninitialized
         2 | const x = @uninit(Bad);
           |           ^^^^^^^^^^^^ cannot use @uninit on this struct
           |
-         ::: main.plk:1:31
+          = help: @uninit only supports types that do not contain never or function
+        "#],
+    );
+}
+
+#[test]
+fn test_uninit_struct_with_invalid_tuple_field() {
+    assert_diagnostics(
+        r#"
+        const Bad = struct { a: u256, b: tuple { function } };
+        const x = @uninit(Bad);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: struct contains field that cannot be uninitialized
+         --> main.plk:2:11
           |
-        1 | const Bad = struct { a: u256, b: function };
-          |                               ----------- type 'function' cannot be uninitialized
+        1 | const Bad = struct { a: u256, b: tuple { function } };
+          |                               --------------------- type 'tuple {function}' cannot be uninitialized
+        2 | const x = @uninit(Bad);
+          |           ^^^^^^^^^^^^ cannot use @uninit on this struct
           |
-          = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
+          = help: @uninit only supports types that do not contain never or function
         "#],
     );
 }
@@ -1788,23 +1835,22 @@ fn test_uninit_struct_with_comptime_only_field_direct_runtime_scope_is_comptime_
 fn test_uninit_struct_with_memptr_and_invalid_field_reports_invalid_field() {
     assert_diagnostics(
         r#"
-        const Bad = struct { ptr: memptr, f: function };
+        const Bad = struct { ptr: memptr, f: never };
+
         const x = @uninit(Bad);
         init { @evm_stop(); }
         "#,
         &[r#"
         error: struct contains field that cannot be uninitialized
-         --> main.plk:2:11
+         --> main.plk:3:11
           |
-        2 | const x = @uninit(Bad);
+        1 | const Bad = struct { ptr: memptr, f: never };
+          |                                   -------- type 'never' cannot be uninitialized
+        2 |
+        3 | const x = @uninit(Bad);
           |           ^^^^^^^^^^^^ cannot use @uninit on this struct
           |
-         ::: main.plk:1:35
-          |
-        1 | const Bad = struct { ptr: memptr, f: function };
-          |                                   ----------- type 'function' cannot be uninitialized
-          |
-          = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
+          = help: @uninit only supports types that do not contain never or function
         "#],
     );
 }
@@ -1817,36 +1863,17 @@ fn test_uninit_struct_reports_all_invalid_fields() {
         const x = @uninit(Bad);
         init { @evm_stop(); }
         "#,
-        &[
-            r#"
-            error: struct contains field that cannot be uninitialized
-             --> main.plk:2:11
-              |
-            2 | const x = @uninit(Bad);
-              |           ^^^^^^^^^^^^ cannot use @uninit on this struct
-              |
-             ::: main.plk:1:22
-              |
-            1 | const Bad = struct { f: function, g: function };
-              |                      ----------- type 'function' cannot be uninitialized
-              |
-              = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
-            "#,
-            r#"
-            error: struct contains field that cannot be uninitialized
-             --> main.plk:2:11
-              |
-            2 | const x = @uninit(Bad);
-              |           ^^^^^^^^^^^^ cannot use @uninit on this struct
-              |
-             ::: main.plk:1:35
-              |
-            1 | const Bad = struct { f: function, g: function };
-              |                                   ----------- type 'function' cannot be uninitialized
-              |
-              = help: @uninit only supports u256, bool, void, type, cbytes, memptr and struct types
-            "#,
-        ],
+        &[r#"
+        error: struct contains field that cannot be uninitialized
+         --> main.plk:2:11
+          |
+        1 | const Bad = struct { f: function, g: function };
+          |                      ----------- type 'function' cannot be uninitialized
+        2 | const x = @uninit(Bad);
+          |           ^^^^^^^^^^^^ cannot use @uninit on this struct
+          |
+          = help: @uninit only supports types that do not contain never or function
+        "#],
     );
 }
 

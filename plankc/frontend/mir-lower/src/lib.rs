@@ -82,6 +82,7 @@ impl LowerCtx<'_> {
             Type::Struct(r#struct) => {
                 r#struct.fields.iter().map(|&field| self.size_in_locals(field.ty)).sum()
             }
+            Type::Tuple(tuple) => tuple.elements.iter().map(|&ty| self.size_in_locals(ty)).sum(),
         }
     }
 }
@@ -181,7 +182,8 @@ fn lower_basic_block(
                         current_bb.add_set_const_op(sets, x);
                     }
 
-                    Value::StructVal { fields, ty } => {
+                    Value::StructVal { ty, fields: children }
+                    | Value::TupleVal { ty, elements: children } => {
                         let size = ctx.size_in_locals(ty);
                         ctx.locals_map.ensure_many(
                             target,
@@ -189,11 +191,11 @@ fn lower_basic_block(
                             size as usize,
                         );
                         let mut locals = ctx.locals_map.get(target).iter().copied();
-                        materialize_constant_struct_literal(
+                        materialize_constant_compound_literal(
                             values,
                             &mut current_bb,
                             &mut locals,
-                            fields,
+                            children,
                         )
                     }
                     Value::Type(_) | Value::Bytes(_) | Value::Closure { .. } => {
@@ -274,8 +276,9 @@ fn lower_basic_block(
                         };
                     }
                 }
-                Expr::StructLit { ty, fields } => {
-                    lower_struct_literal(ctx, &mut current_bb, target, ty, fields);
+                Expr::StructLit { ty, fields: children }
+                | Expr::TupleLit { ty, elements: children } => {
+                    lower_compound_literal(ctx, &mut current_bb, target, ty, children);
                 }
                 Expr::FieldAccess { object, field_index } => {
                     lower_field_access(ctx, &mut current_bb, target, mir_func, object, field_index);
@@ -402,7 +405,7 @@ fn lower_basic_block(
     CFGSegment { bb_in: bb_in.unwrap_or(bb_out), bb_out, end_loose: true }
 }
 
-fn materialize_constant_struct_literal(
+fn materialize_constant_compound_literal(
     values: &ValueInterner,
     bb: &mut BasicBlockBuilder<'_, '_>,
     targets: &mut impl Iterator<Item = sir::LocalId>,
@@ -423,8 +426,9 @@ fn materialize_constant_struct_literal(
                 let sets = targets.next().expect("target count, size mismatch");
                 bb.add_set_const_op(sets, x);
             }
-            Value::StructVal { ty: _, fields } => {
-                materialize_constant_struct_literal(values, bb, targets, fields);
+            Value::StructVal { ty: _, fields: children }
+            | Value::TupleVal { ty: _, elements: children } => {
+                materialize_constant_compound_literal(values, bb, targets, children);
             }
             Value::Type(_) | Value::Bytes(_) | Value::Closure { .. } => {
                 unreachable!("MIR: comptime-only value")
@@ -433,19 +437,19 @@ fn materialize_constant_struct_literal(
     }
 }
 
-fn lower_struct_literal(
+fn lower_compound_literal(
     ctx: &mut LowerCtx<'_>,
     bb: &mut BasicBlockBuilder<'_, '_>,
     target: mir::LocalId,
-    struct_type: TypeId,
-    fields: mir::ArgsId,
+    compound_type: TypeId,
+    children: mir::ArgsId,
 ) {
-    let size = ctx.size_in_locals(struct_type);
+    let size = ctx.size_in_locals(compound_type);
     if size == 0 {
         return;
     }
     ctx.locals_map.ensure_many(target, || bb.new_local(), size as usize);
-    for (src, dst) in ctx.mir.args[fields]
+    for (src, dst) in ctx.mir.args[children]
         .iter()
         .flat_map(|src_local| ctx.locals_map.get(*src_local))
         .zip(ctx.locals_map.get(target))

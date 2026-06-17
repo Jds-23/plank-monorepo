@@ -416,6 +416,32 @@ fn test_paren_expr_simple() {
 }
 
 #[test]
+fn test_paren_expr_single_identifier_not_tuple() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const x = (x);
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "x"
+                " "
+                "="
+                " "
+                ParenExpr
+                    "("
+                    Identifier
+                        "x"
+                    ")"
+                ";"
+        "#,
+    );
+}
+
+#[test]
 fn test_paren_expr_nested() {
     assert_parses_to_cst_no_errors_dedented(
         r#"
@@ -1931,6 +1957,227 @@ fn test_struct_lit_trailing_comma() {
                     ","
                     " "
                     "}"
+                ";"
+        "#,
+    );
+}
+
+// =============================================================================
+// Tuple Types & Literals
+// =============================================================================
+
+#[test]
+fn test_tuple_type_zero_elements() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const T = tuple {};
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "T"
+                " "
+                "="
+                " "
+                TupleType
+                    "tuple"
+                    " "
+                    "{"
+                    "}"
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_tuple_type_trailing_comma() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const T = tuple { u256, bool, };
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "T"
+                " "
+                "="
+                " "
+                TupleType
+                    "tuple"
+                    " "
+                    "{"
+                    " "
+                    Identifier
+                        "u256"
+                    ","
+                    " "
+                    Identifier
+                        "bool"
+                    ","
+                    " "
+                    "}"
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_tuple_type_complex_element() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const T = tuple { Map(Key), bool };
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "T"
+                " "
+                "="
+                " "
+                TupleType
+                    "tuple"
+                    " "
+                    "{"
+                    " "
+                    CallExpr
+                        Identifier
+                            "Map"
+                        "("
+                        Identifier
+                            "Key"
+                        ")"
+                    ","
+                    " "
+                    Identifier
+                        "bool"
+                    " "
+                    "}"
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_tuple_lit_zero_elements() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const v = ();
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "v"
+                " "
+                "="
+                " "
+                TupleLit
+                    "("
+                    ")"
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_tuple_lit_singleton() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const v = (x,);
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "v"
+                " "
+                "="
+                " "
+                TupleLit
+                    "("
+                    Identifier
+                        "x"
+                    ","
+                    ")"
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_tuple_lit_trailing_comma() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const v = (x, y,);
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "v"
+                " "
+                "="
+                " "
+                TupleLit
+                    "("
+                    Identifier
+                        "x"
+                    ","
+                    " "
+                    Identifier
+                        "y"
+                    ","
+                    ")"
+                ";"
+        "#,
+    );
+}
+
+#[test]
+fn test_tuple_lit_complex_element() {
+    assert_parses_to_cst_no_errors_dedented(
+        r#"
+        const v = (f(x), y);
+        "#,
+        r#"
+        File
+            ConstDecl { typed: false }
+                "const"
+                " "
+                Identifier
+                    "v"
+                " "
+                "="
+                " "
+                TupleLit
+                    "("
+                    CallExpr
+                        Identifier
+                            "f"
+                        "("
+                        Identifier
+                            "x"
+                        ")"
+                    ","
+                    " "
+                    Identifier
+                        "y"
+                    ")"
                 ";"
         "#,
     );

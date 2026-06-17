@@ -24,7 +24,7 @@ fn test_struct_field_access() {
         @fn0() -> never {
             %0 : u256 = 34
             %1 : bool = false
-            %2 : Pair = struct#0 {
+            %2 : Pair = Pair {
                 49,
                 true,
             }
@@ -221,6 +221,26 @@ fn test_comptime_struct_field_type_mismatch() {
           |
         2 | const my_pair = Pair { a: false, b: false };
           |                           ^^^^^ field `a` expects `u256`, got `bool`
+        "#],
+    );
+}
+
+#[test]
+fn test_mixed_struct_type() {
+    assert_diagnostics(
+        r#"
+        const S = struct { t: type, p: memptr };
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: defining uninstantiable type
+         --> main.plk:1:11
+          |
+        1 | const S = struct { t: type, p: memptr };
+          |           ^^^^^^^^^-------^^---------^^
+          |                    |        |
+          |                    |        type 'memptr' is runtime only
+          |                    type 'type' is comptime only
         "#],
     );
 }
@@ -684,30 +704,11 @@ fn test_type_index_expr_eagerly_evaluates() {
         ==== Functions ====
         ; init
         @fn0() -> never {
-            %0 : struct@main.plk:5:13 = struct#0 {
+            %0 : struct@main.plk:5:13 = struct@main.plk:5:13 {
                 67,
             }
             %1 : never = @evm_stop()
         }
         "#,
-    );
-}
-
-#[test]
-fn test_struct_with_never_field() {
-    assert_diagnostics(
-        r#"
-        const S = struct { x: u256, y: never };
-        init {
-            @evm_stop();
-        }
-        "#,
-        &[r#"
-        error: `never` not valid struct field type
-         --> main.plk:1:29
-          |
-        1 | const S = struct { x: u256, y: never };
-          |                             ^^^^^^^^ type of `y` evaluated to `never`
-        "#],
     );
 }

@@ -2,12 +2,15 @@ use plank_core::{chunked_arena::ChunkedArena, list_of_lists::ListOfLists, newtyp
 use std::{
     cell::{Cell, UnsafeCell},
     fmt,
-    mem::align_of,
+    mem::{align_of, size_of},
     num::NonZero,
 };
 
-use crate::{ValueId, ValueInterner};
-use hashbrown::{DefaultHashBuilder, HashSet, HashTable, hash_table::Entry};
+use crate::{
+    ValueId, ValueInterner,
+    primitive_types::{PrimitiveType, TypeFlags},
+};
+use hashbrown::{DefaultHashBuilder, HashTable, hash_table::Entry};
 use plank_session::{Session, SourceSpan, SrcLoc, StrId};
 
 newtype_index! {
@@ -20,6 +23,15 @@ pub enum TypeName {
     Parameterized { name: StrId, args: TypeNameArgsId },
 }
 
+const fn const_max(lhs: usize, rhs: usize) -> usize {
+    if lhs > rhs { lhs } else { rhs }
+}
+
+const MIN_COMPOUND_ALIGN: usize = const_max(
+    const_max(align_of::<StructHeader>(), align_of::<Field>()),
+    const_max(align_of::<TupleHeader>(), align_of::<TypeId>()),
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Field {
     pub name: StrId,
@@ -29,90 +41,86 @@ pub struct Field {
 
 struct StructHeader {
     def_loc: SrcLoc,
+    flags: TypeFlags,
     type_index: ValueId,
     name: Cell<Option<TypeName>>,
     total_fields: u32,
 }
 
-const _HEADER_FIELD_ALIGN_EQ: () =
-    const { assert!(align_of::<Field>() == align_of::<StructHeader>()) };
-
-const MIN_STRUCT_FIELD_ALIGN: usize = {
-    let () = _HEADER_FIELD_ALIGN_EQ;
-    align_of::<StructHeader>()
-};
-
 #[derive(Debug, Clone, Copy)]
 pub struct StructView<'a> {
     pub def_loc: SrcLoc,
+    pub flags: TypeFlags,
     pub type_index: ValueId,
     pub name: &'a Cell<Option<TypeName>>,
     pub fields: &'a [Field],
 }
 
-impl StructView<'_> {
-    fn as_info(&self) -> StructInfo<'_> {
-        StructInfo { def_loc: self.def_loc, type_index: self.type_index, fields: self.fields }
+impl<'a> StructView<'a> {
+    fn as_key(self) -> StructKey<'a> {
+        StructKey { def_loc: self.def_loc, type_index: self.type_index, fields: self.fields }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StructInfo<'a> {
+pub struct StructKey<'a> {
     pub type_index: ValueId,
     pub def_loc: SrcLoc,
     pub fields: &'a [Field],
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(test, derive(enum_iterator::Sequence))]
-pub enum PrimitiveType {
-    Void,
-    U256,
-    Bool,
-    MemoryPointer,
-    Type,
-    Function,
-    CBytes,
-    Never,
+pub struct TupleView<'a> {
+    pub flags: TypeFlags,
+    pub elements: &'a [TypeId],
 }
 
-impl PrimitiveType {
-    pub const fn name(self) -> &'static str {
-        use plank_session::builtins::builtin_names;
-        match self {
-            PrimitiveType::Void => builtin_names::VOID,
-            PrimitiveType::U256 => builtin_names::U256,
-            PrimitiveType::Bool => builtin_names::BOOL,
-            PrimitiveType::MemoryPointer => builtin_names::MEMORY_POINTER,
-            PrimitiveType::Type => builtin_names::TYPE,
-            PrimitiveType::Function => builtin_names::FUNCTION,
-            PrimitiveType::CBytes => builtin_names::CBYTES,
-            PrimitiveType::Never => builtin_names::NEVER,
-        }
+impl<'a> TupleView<'a> {
+    fn as_key(self) -> TupleKey<'a> {
+        TupleKey { elements: self.elements }
     }
+}
 
-    pub const fn comptime_only(self) -> bool {
-        match self {
-            PrimitiveType::Void
-            | PrimitiveType::U256
-            | PrimitiveType::Bool
-            | PrimitiveType::MemoryPointer
-            | PrimitiveType::Never => false,
-            PrimitiveType::Type | PrimitiveType::Function | PrimitiveType::CBytes => true,
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TupleKey<'a> {
+    pub elements: &'a [TypeId],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MixedComptimeAndRuntime;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompoundKind {
+    Struct(StructRef),
+    Tuple(TupleRef),
+}
+
+struct TupleHeader {
+    flags: TypeFlags,
+    total_elements: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum Type<'fields> {
     Primitive(PrimitiveType),
     Struct(StructView<'fields>),
+    Tuple(TupleView<'fields>),
+}
+
+impl Type<'_> {
+    pub fn flags(&self) -> TypeFlags {
+        match self {
+            Type::Primitive(p) => p.flags(),
+            Type::Struct(r#struct) => r#struct.flags,
+            Type::Tuple(tuple) => tuple.flags,
+        }
+    }
 }
 
 pub struct TypeInterner {
-    comptime_only: UnsafeCell<HashSet<StructRef>>,
-    dedup: UnsafeCell<HashTable<StructRef>>,
-    arena: ChunkedArena<MIN_STRUCT_FIELD_ALIGN>,
+    struct_dedup: UnsafeCell<HashTable<StructRef>>,
+    tuple_dedup: UnsafeCell<HashTable<TupleRef>>,
+    arena: ChunkedArena<MIN_COMPOUND_ALIGN>,
     hasher: DefaultHashBuilder,
     type_name_args: UnsafeCell<ListOfLists<TypeNameArgsId, ValueId>>,
 }
@@ -127,11 +135,10 @@ impl Default for TypeInterner {
 /// the primitive type constants.
 ///
 /// # Representation
-/// For structs the [`ChunkedArena`] offset is stored verbatim. Thanks to the guarantees from
-/// [`alloc_append`](ChunkedArena::alloc_append) we know that offsets will be a multiple of our
-/// chosen alignment ([`MIN_STRUCT_FIELD_ALIGN`]). This lets us uniquely identify primitive types
-/// by ensuring they are *not* multiples of [`MIN_STRUCT_FIELD_ALIGN`], this is done by setting the
-/// lower bit via [`IS_PRIMITIVE_FLAG`](TypeId::IS_PRIMITIVE_FLAG).
+/// For compound types the [`ChunkedArena`] offset is stored with spare low bits used as tags.
+/// Thanks to the guarantees from [`alloc_append`](ChunkedArena::alloc_append) we know that offsets
+/// will be a multiple of our chosen alignment ([`MIN_COMPOUND_ALIGN`]). The lowest bit identifies
+/// primitive types and the next bit distinguishes tuple compounds from struct compounds.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(pub(crate) NonZero<u32>);
 
@@ -146,13 +153,47 @@ impl std::fmt::Debug for TypeId {
             TypeId::FUNCTION => write!(f, "TypeId::FUNCTION"),
             TypeId::CBYTES => write!(f, "TypeId::CBYTES"),
             TypeId::NEVER => write!(f, "TypeId::NEVER"),
-            other => write!(f, "TypeId({})", other.get()),
+            compound => write!(f, "TypeId({})", compound.get()),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StructRef(u32);
+pub struct CompoundRef(u32);
+
+impl CompoundRef {
+    const TUPLE_TAG: u32 = 0b10;
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    const fn new_struct(offset: u32) -> Self {
+        CompoundRef(offset)
+    }
+
+    const fn new_tuple(offset: u32) -> Self {
+        CompoundRef(offset | Self::TUPLE_TAG)
+    }
+
+    const fn offset(self) -> u32 {
+        self.0 & !Self::TUPLE_TAG
+    }
+
+    const fn kind(self) -> CompoundKind {
+        if self.0 & Self::TUPLE_TAG == 0 {
+            CompoundKind::Struct(StructRef(self))
+        } else {
+            CompoundKind::Tuple(TupleRef(self))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StructRef(CompoundRef);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TupleRef(CompoundRef);
 
 impl TypeId {
     pub const VOID: TypeId = TypeId::from_primitive(PrimitiveType::Void);
@@ -182,16 +223,24 @@ impl TypeId {
     }
 
     pub const fn from_primitive(primitive: PrimitiveType) -> TypeId {
-        const { assert!(Self::IS_PRIMITIVE_FLAG < MIN_STRUCT_FIELD_ALIGN as u32) };
+        const { assert!(Self::IS_PRIMITIVE_FLAG < MIN_COMPOUND_ALIGN as u32) };
         let pid = primitive as u32;
-        TypeId::new((pid * MIN_STRUCT_FIELD_ALIGN as u32) | Self::IS_PRIMITIVE_FLAG)
+        TypeId::new((pid * MIN_COMPOUND_ALIGN as u32) | Self::IS_PRIMITIVE_FLAG)
+    }
+
+    pub const fn from_compound(compound: CompoundRef) -> TypeId {
+        TypeId::new(compound.0)
     }
 
     pub const fn from_struct(offset: StructRef) -> TypeId {
-        TypeId::new(offset.0)
+        TypeId::from_compound(offset.0)
     }
 
-    pub const fn as_primitive(self) -> Result<PrimitiveType, StructRef> {
+    pub const fn from_tuple(offset: TupleRef) -> TypeId {
+        TypeId::from_compound(offset.0)
+    }
+
+    pub const fn as_primitive(self) -> Result<PrimitiveType, CompoundRef> {
         match self {
             TypeId::VOID => Ok(PrimitiveType::Void),
             TypeId::U256 => Ok(PrimitiveType::U256),
@@ -201,7 +250,7 @@ impl TypeId {
             TypeId::FUNCTION => Ok(PrimitiveType::Function),
             TypeId::CBYTES => Ok(PrimitiveType::CBytes),
             TypeId::NEVER => Ok(PrimitiveType::Never),
-            ty => Err(StructRef(ty.get())),
+            ty => Err(CompoundRef(ty.get())),
         }
     }
 
@@ -221,18 +270,18 @@ impl TypeId {
     }
 }
 
-impl From<StructRef> for TypeId {
-    fn from(value: StructRef) -> Self {
-        Self::from_struct(value)
-    }
-}
+const _TYPE_ID_TAGS_OK: () = const {
+    assert!(TypeId::IS_PRIMITIVE_FLAG < MIN_COMPOUND_ALIGN as u32);
+    assert!(CompoundRef::TUPLE_TAG < MIN_COMPOUND_ALIGN as u32);
+    assert!(CompoundRef::TUPLE_TAG & TypeId::IS_PRIMITIVE_FLAG == 0);
+};
 
 impl TypeInterner {
     pub fn new() -> Self {
         Self {
-            comptime_only: UnsafeCell::new(HashSet::new()),
+            struct_dedup: UnsafeCell::new(HashTable::new()),
+            tuple_dedup: UnsafeCell::new(HashTable::new()),
             arena: ChunkedArena::new(),
-            dedup: UnsafeCell::new(HashTable::new()),
             hasher: DefaultHashBuilder::default(),
             type_name_args: UnsafeCell::new(ListOfLists::new()),
         }
@@ -241,31 +290,60 @@ impl TypeInterner {
     pub fn is_comptime_only(&self, ty: TypeId) -> bool {
         match ty.as_primitive() {
             Ok(prim) => prim.comptime_only(),
-            Err(r#struct) => unsafe { (*self.comptime_only.get()).contains(&r#struct) },
+            Err(compound) => {
+                self.lookup_compound(compound).flags().contains(TypeFlags::COMPTIME_ONLY)
+            }
         }
     }
 
-    pub fn intern_struct(&self, info: StructInfo<'_>) -> StructRef {
+    pub fn intern_struct(
+        &self,
+        key: StructKey<'_>,
+    ) -> (StructRef, Result<(), MixedComptimeAndRuntime>) {
         use std::hash::BuildHasher;
-        let hash = self.hasher.hash_one(info);
+
+        let hash = self.hasher.hash_one(key);
         // Safety: We only retain the `&mut` reference for the duration of this function and
-        // `lookup_struct` and `push_struct` don't reference `self.dedup` at all.
-        let dedup = unsafe { &mut (*self.dedup.get()) };
+        // `lookup_struct` and `push_struct` don't reference `self.struct_dedup` at all.
+        let dedup = unsafe { &mut (*self.struct_dedup.get()) };
         let entry = dedup.entry(
             hash,
-            |&r#struct| self.lookup_struct(r#struct).as_info() == info,
-            |&r#struct| self.hasher.hash_one(self.lookup_struct(r#struct).as_info()),
+            |&r#struct| self.lookup_struct(r#struct).as_key() == key,
+            |&r#struct| self.hasher.hash_one(self.lookup_struct(r#struct).as_key()),
         );
 
         match entry {
-            Entry::Occupied(occupied) => *occupied.get(),
+            Entry::Occupied(occupied) => (*occupied.get(), Ok(())),
             Entry::Vacant(vacant_entry) => {
-                let new_ref = self.push_struct(info);
+                let (new_ref, ok) = self.push_struct(key);
                 vacant_entry.insert(new_ref);
-                if info.fields.iter().any(|&field| self.is_comptime_only(field.ty)) {
-                    unsafe { (*self.comptime_only.get()).insert(new_ref) };
-                }
-                new_ref
+                (new_ref, ok)
+            }
+        }
+    }
+
+    pub fn intern_tuple(
+        &self,
+        key: TupleKey<'_>,
+    ) -> (TupleRef, Result<(), MixedComptimeAndRuntime>) {
+        use std::hash::BuildHasher;
+
+        let hash = self.hasher.hash_one(key);
+        // Safety: We only retain the `&mut` reference for the duration of this function and
+        // `lookup_tuple` and `push_tuple` don't reference `self.tuple_dedup` at all.
+        let dedup = unsafe { &mut (*self.tuple_dedup.get()) };
+        let entry = dedup.entry(
+            hash,
+            |&tuple| self.lookup_tuple(tuple).as_key() == key,
+            |&tuple| self.hasher.hash_one(self.lookup_tuple(tuple).as_key()),
+        );
+
+        match entry {
+            Entry::Occupied(occupied) => (*occupied.get(), Ok(())),
+            Entry::Vacant(vacant_entry) => {
+                let (new_ref, ok) = self.push_tuple(key);
+                vacant_entry.insert(new_ref);
+                (new_ref, ok)
             }
         }
     }
@@ -273,21 +351,48 @@ impl TypeInterner {
     pub fn lookup<'s>(&'s self, ty: TypeId) -> Type<'s> {
         match ty.as_primitive() {
             Ok(prim) => Type::Primitive(prim),
-            Err(r#struct) => Type::Struct(self.lookup_struct(r#struct)),
+            Err(compound) => match self.lookup_compound(compound) {
+                CompoundView::Struct(view) => Type::Struct(view),
+                CompoundView::Tuple(view) => Type::Tuple(view),
+            },
+        }
+    }
+
+    fn lookup_compound<'s>(&'s self, compound: CompoundRef) -> CompoundView<'s> {
+        match compound.kind() {
+            CompoundKind::Struct(r#ref) => CompoundView::Struct(self.lookup_struct(r#ref)),
+            CompoundKind::Tuple(r#ref) => CompoundView::Tuple(self.lookup_tuple(r#ref)),
         }
     }
 
     pub fn lookup_struct<'s>(&'s self, r#struct: StructRef) -> StructView<'s> {
         unsafe {
-            let header_ptr = self.arena.get(r#struct.0) as *const StructHeader;
+            let header_ptr = self.arena.get(r#struct.0.offset()) as *const StructHeader;
             let header = &(*header_ptr);
             let fields_start = header_ptr.add(1) as *const Field;
 
             StructView {
                 def_loc: header.def_loc,
+                flags: header.flags,
                 type_index: header.type_index,
                 name: &header.name,
                 fields: core::slice::from_raw_parts(fields_start, header.total_fields as usize),
+            }
+        }
+    }
+
+    pub fn lookup_tuple<'s>(&'s self, tuple: TupleRef) -> TupleView<'s> {
+        unsafe {
+            let header_ptr = self.arena.get(tuple.0.offset()) as *const TupleHeader;
+            let header = &(*header_ptr);
+            let elements_start = header_ptr.add(1) as *const TypeId;
+
+            TupleView {
+                flags: header.flags,
+                elements: core::slice::from_raw_parts(
+                    elements_start,
+                    header.total_elements as usize,
+                ),
             }
         }
     }
@@ -335,6 +440,24 @@ impl TypeInterner {
         write!(f, "struct@{}:{line}:{col}", source.path.display())
     }
 
+    pub fn fmt_tuple(
+        &self,
+        f: &mut impl fmt::Write,
+        tuple: TupleRef,
+        session: &Session,
+        values: &ValueInterner,
+    ) -> fmt::Result {
+        let view = self.lookup_tuple(tuple);
+        f.write_str("tuple {")?;
+        for (i, &element) in view.elements.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}", self.format(session, values, element))?;
+        }
+        f.write_str("}")
+    }
+
     fn fmt_type_name_args(
         &self,
         f: &mut impl fmt::Write,
@@ -363,14 +486,25 @@ impl TypeInterner {
         FmtType { types: self, values, sess, ty }
     }
 
-    fn push_struct<'s, 'a>(&'s self, r#struct: StructInfo<'a>) -> StructRef {
+    fn push_struct(
+        &self,
+        r#struct: StructKey<'_>,
+    ) -> (StructRef, Result<(), MixedComptimeAndRuntime>) {
         let required_space =
             std::mem::size_of::<StructHeader>() + std::mem::size_of_val(r#struct.fields);
 
-        unsafe {
-            // The `_HEADER_FIELD_ALIGN_EQ` const assert is what tells us that it's safe to cast to
-            // field & struct header pointers.
-            let () = _HEADER_FIELD_ALIGN_EQ;
+        let flags = r#struct
+            .fields
+            .iter()
+            .fold(TypeFlags::NONE, |flags, field| flags | self.lookup(field.ty).flags());
+
+        const {
+            assert!(align_of::<StructHeader>() <= MIN_COMPOUND_ALIGN);
+            assert!(align_of::<Field>() <= MIN_COMPOUND_ALIGN);
+            assert!(align_of::<Field>() <= size_of::<StructHeader>())
+        }
+
+        let r#struct = unsafe {
             let (offset, new_struct_ptr) = self.arena.alloc_append(required_space);
 
             let fields_start = new_struct_ptr.byte_add(size_of::<StructHeader>()) as *mut Field;
@@ -383,13 +517,73 @@ impl TypeInterner {
             let header_ptr = new_struct_ptr as *mut StructHeader;
             header_ptr.write(StructHeader {
                 def_loc: r#struct.def_loc,
+                flags,
                 type_index: r#struct.type_index,
                 name: Cell::new(None),
                 total_fields: r#struct.fields.len() as u32,
             });
 
-            debug_assert!(offset.is_multiple_of(MIN_STRUCT_FIELD_ALIGN as u32));
-            StructRef(offset)
+            debug_assert!(offset.is_multiple_of(MIN_COMPOUND_ALIGN as u32));
+            StructRef(CompoundRef::new_struct(offset))
+        };
+        let mixed = if flags.contains(TypeFlags::UNINITIALIZABLE_MIXED) {
+            Err(MixedComptimeAndRuntime)
+        } else {
+            Ok(())
+        };
+        (r#struct, mixed)
+    }
+
+    fn push_tuple(&self, tuple: TupleKey<'_>) -> (TupleRef, Result<(), MixedComptimeAndRuntime>) {
+        let required_space =
+            std::mem::size_of::<TupleHeader>() + std::mem::size_of_val(tuple.elements);
+
+        const {
+            assert!(align_of::<TupleHeader>() <= MIN_COMPOUND_ALIGN);
+            assert!(align_of::<TypeId>() <= MIN_COMPOUND_ALIGN);
+            assert!(align_of::<TypeId>() <= align_of::<TupleHeader>());
+        }
+
+        let flags = tuple
+            .elements
+            .iter()
+            .fold(TypeFlags::NONE, |flags, element| flags | self.lookup(*element).flags());
+
+        let tuple = unsafe {
+            let (offset, new_tuple_ptr) = self.arena.alloc_append(required_space);
+
+            let elements_start = new_tuple_ptr.byte_add(size_of::<TupleHeader>()) as *mut TypeId;
+            let mut element_ptr = elements_start;
+            for &element in tuple.elements {
+                element_ptr.write(element);
+                element_ptr = element_ptr.add(1);
+            }
+
+            let header_ptr = new_tuple_ptr as *mut TupleHeader;
+            header_ptr.write(TupleHeader { flags, total_elements: tuple.elements.len() as u32 });
+
+            debug_assert!(offset.is_multiple_of(MIN_COMPOUND_ALIGN as u32));
+            TupleRef(CompoundRef::new_tuple(offset))
+        };
+        let mixed = if flags.contains(TypeFlags::UNINITIALIZABLE_MIXED) {
+            Err(MixedComptimeAndRuntime)
+        } else {
+            Ok(())
+        };
+        (tuple, mixed)
+    }
+}
+
+enum CompoundView<'a> {
+    Struct(StructView<'a>),
+    Tuple(TupleView<'a>),
+}
+
+impl CompoundView<'_> {
+    pub fn flags(&self) -> TypeFlags {
+        match self {
+            CompoundView::Struct(r#struct) => r#struct.flags,
+            CompoundView::Tuple(tuple) => tuple.flags,
         }
     }
 }
@@ -405,7 +599,14 @@ impl std::fmt::Display for FmtType<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.ty.as_primitive() {
             Ok(prim) => write!(f, "{}", prim.name()),
-            Err(r#struct) => self.types.fmt_struct(f, r#struct, self.sess, self.values),
+            Err(compound) => match self.types.lookup_compound(compound) {
+                CompoundView::Struct(_) => {
+                    self.types.fmt_struct(f, StructRef(compound), self.sess, self.values)
+                }
+                CompoundView::Tuple(_) => {
+                    self.types.fmt_tuple(f, TupleRef(compound), self.sess, self.values)
+                }
+            },
         }
     }
 }
@@ -425,8 +626,8 @@ mod tests {
         SrcLoc::new(SourceId::new(id), ZERO_SPAN)
     }
 
-    fn dummy_struct_info(fields: &[Field]) -> StructInfo<'_> {
-        StructInfo { type_index: ValueId::VOID, def_loc: dummy_src_loc(0), fields }
+    fn dummy_struct_info(fields: &[Field]) -> StructKey<'_> {
+        StructKey { type_index: ValueId::VOID, def_loc: dummy_src_loc(0), fields }
     }
 
     #[test]
@@ -442,28 +643,35 @@ mod tests {
         let interner = TypeInterner::new();
         let fields = [Field { name: builtins::U256, ty: TypeId::U256, def_span: ZERO_SPAN }];
 
-        let a = interner.intern_struct(dummy_struct_info(&fields));
-        let b = interner.intern_struct(dummy_struct_info(&fields));
+        let (a, a_status) = interner.intern_struct(dummy_struct_info(&fields));
+        let (b, b_status) = interner.intern_struct(dummy_struct_info(&fields));
         assert_eq!(a, b);
+        assert_eq!(a_status, Ok(()));
+        assert_eq!(b_status, Ok(()));
 
         let different = [Field { name: builtins::BOOL, ty: TypeId::BOOL, def_span: ZERO_SPAN }];
-        let c = interner.intern_struct(dummy_struct_info(&different));
+        let (c, c_status) = interner.intern_struct(dummy_struct_info(&different));
         assert_ne!(a, c);
+        assert_eq!(c_status, Ok(()));
     }
 
     #[test]
-    fn struct_refs_are_aligned() {
+    fn compound_refs_have_aligned_offsets_and_kind_tags() {
         let interner = TypeInterner::new();
         let f = Field { name: builtins::U256, ty: TypeId::U256, def_span: ZERO_SPAN };
 
-        let a = interner.intern_struct(dummy_struct_info(&[f]));
-        let b = interner.intern_struct(dummy_struct_info(&[f, f]));
-        let c = interner.intern_struct(dummy_struct_info(&[f, f, f]));
+        let (a, _) = interner.intern_struct(dummy_struct_info(&[f]));
+        let (b, _) = interner.intern_struct(dummy_struct_info(&[f, f]));
+        let (c, _) = interner.intern_struct(dummy_struct_info(&[f, f, f]));
 
         for r#struct in [a, b, c] {
-            let raw = TypeId::from_struct(r#struct).get();
-            assert!(raw.is_multiple_of(MIN_STRUCT_FIELD_ALIGN as u32));
+            assert!(matches!(r#struct.0.kind(), CompoundKind::Struct(_)));
+            assert!(r#struct.0.offset().is_multiple_of(MIN_COMPOUND_ALIGN as u32));
         }
+
+        let (tuple, _) = interner.intern_tuple(TupleKey { elements: &[TypeId::U256] });
+        assert!(matches!(tuple.0.kind(), CompoundKind::Tuple(_)));
+        assert!(tuple.0.offset().is_multiple_of(MIN_COMPOUND_ALIGN as u32));
     }
 
     #[test]
@@ -472,13 +680,15 @@ mod tests {
         let fields = [Field { name: builtins::U256, ty: TypeId::U256, def_span: ZERO_SPAN }];
 
         let a_info =
-            StructInfo { type_index: ValueId::VOID, def_loc: dummy_src_loc(0), fields: &fields };
+            StructKey { type_index: ValueId::VOID, def_loc: dummy_src_loc(0), fields: &fields };
         let b_info =
-            StructInfo { type_index: ValueId::VOID, def_loc: dummy_src_loc(1), fields: &fields };
+            StructKey { type_index: ValueId::VOID, def_loc: dummy_src_loc(1), fields: &fields };
 
-        let a = interner.intern_struct(a_info);
-        let b = interner.intern_struct(b_info);
+        let (a, a_status) = interner.intern_struct(a_info);
+        let (b, b_status) = interner.intern_struct(b_info);
         assert_ne!(a, b);
+        assert_eq!(a_status, Ok(()));
+        assert_eq!(b_status, Ok(()));
     }
 
     #[test]
@@ -486,18 +696,109 @@ mod tests {
         let interner = TypeInterner::new();
 
         let inner_fields = [Field { name: builtins::U256, ty: TypeId::TYPE, def_span: ZERO_SPAN }];
-        let inner = interner.intern_struct(dummy_struct_info(&inner_fields));
+        let (inner, inner_status) = interner.intern_struct(dummy_struct_info(&inner_fields));
+        assert_eq!(inner_status, Ok(()));
         let inner_ty = TypeId::from_struct(inner);
         assert!(interner.is_comptime_only(inner_ty));
 
         let outer_fields = [Field { name: builtins::BOOL, ty: inner_ty, def_span: ZERO_SPAN }];
-        let outer = interner.intern_struct(dummy_struct_info(&outer_fields));
+        let (outer, outer_status) = interner.intern_struct(dummy_struct_info(&outer_fields));
+        assert_eq!(outer_status, Ok(()));
         let outer_ty = TypeId::from_struct(outer);
         assert!(interner.is_comptime_only(outer_ty));
 
         let runtime_fields =
             [Field { name: builtins::CBYTES, ty: TypeId::U256, def_span: ZERO_SPAN }];
-        let runtime = interner.intern_struct(dummy_struct_info(&runtime_fields));
+        let (runtime, runtime_status) = interner.intern_struct(dummy_struct_info(&runtime_fields));
+        assert_eq!(runtime_status, Ok(()));
         assert!(!interner.is_comptime_only(TypeId::from_struct(runtime)));
+    }
+
+    #[test]
+    fn tuple_intern_deduplication() {
+        let interner = TypeInterner::new();
+        let elements = [TypeId::U256, TypeId::BOOL];
+
+        let (a, a_status) = interner.intern_tuple(TupleKey { elements: &elements });
+        let (b, b_status) = interner.intern_tuple(TupleKey { elements: &elements });
+        assert_eq!(a, b);
+        assert_eq!(a_status, Ok(()));
+        assert_eq!(b_status, Ok(()));
+
+        let different = [TypeId::BOOL, TypeId::U256];
+        let (c, c_status) = interner.intern_tuple(TupleKey { elements: &different });
+        assert_ne!(a, c);
+        assert_eq!(c_status, Ok(()));
+    }
+
+    #[test]
+    fn empty_tuple_is_not_void() {
+        let interner = TypeInterner::new();
+        let (tuple, status) = interner.intern_tuple(TupleKey { elements: &[] });
+        assert_eq!(status, Ok(()));
+        let tuple_ty = TypeId::from_tuple(tuple);
+
+        assert_ne!(tuple_ty, TypeId::VOID);
+        let Type::Tuple(view) = interner.lookup(tuple_ty) else { panic!("expected tuple type") };
+        assert!(view.elements.is_empty());
+    }
+
+    #[test]
+    fn tuple_comptime_only_tracks_elements() {
+        let interner = TypeInterner::new();
+
+        let (comptime_tuple, comptime_status) =
+            interner.intern_tuple(TupleKey { elements: &[TypeId::TYPE] });
+        assert_eq!(comptime_status, Ok(()));
+        assert!(interner.is_comptime_only(TypeId::from_tuple(comptime_tuple)));
+
+        let (runtime_tuple, runtime_status) =
+            interner.intern_tuple(TupleKey { elements: &[TypeId::U256] });
+        assert_eq!(runtime_status, Ok(()));
+        assert!(!interner.is_comptime_only(TypeId::from_tuple(runtime_tuple)));
+    }
+
+    #[test]
+    fn mixed_compound_reports_only_on_first_intern() {
+        let interner = TypeInterner::new();
+        let fields = [
+            Field {
+                name: builtins::MEMORY_POINTER,
+                ty: TypeId::MEMORY_POINTER,
+                def_span: ZERO_SPAN,
+            },
+            Field { name: builtins::TYPE, ty: TypeId::TYPE, def_span: ZERO_SPAN },
+        ];
+
+        let (first_struct, first_struct_status) =
+            interner.intern_struct(dummy_struct_info(&fields));
+        let (second_struct, second_struct_status) =
+            interner.intern_struct(dummy_struct_info(&fields));
+        assert_eq!(first_struct, second_struct);
+        assert_eq!(first_struct_status, Err(MixedComptimeAndRuntime));
+        assert_eq!(second_struct_status, Ok(()));
+
+        let elements = [TypeId::MEMORY_POINTER, TypeId::TYPE];
+        let (first_tuple, first_tuple_status) =
+            interner.intern_tuple(TupleKey { elements: &elements });
+        let (second_tuple, second_tuple_status) =
+            interner.intern_tuple(TupleKey { elements: &elements });
+        assert_eq!(first_tuple, second_tuple);
+        assert_eq!(first_tuple_status, Err(MixedComptimeAndRuntime));
+        assert_eq!(second_tuple_status, Ok(()));
+    }
+
+    #[test]
+    fn tuple_and_struct_do_not_dedup() {
+        let mut sess = Session::new();
+        let interner = TypeInterner::new();
+        let field = Field { name: sess.intern("name"), ty: TypeId::U256, def_span: ZERO_SPAN };
+
+        let (r#struct, struct_status) = interner.intern_struct(dummy_struct_info(&[field]));
+        let (tuple, tuple_status) = interner.intern_tuple(TupleKey { elements: &[TypeId::U256] });
+        assert_eq!(struct_status, Ok(()));
+        assert_eq!(tuple_status, Ok(()));
+
+        assert_ne!(TypeId::from_struct(r#struct), TypeId::from_tuple(tuple));
     }
 }

@@ -3,7 +3,7 @@ use alloy_primitives::U256;
 use plank_hir as hir;
 use plank_mir as mir;
 use plank_session::{MaybePoisoned, Poisoned, SourceSpan, SrcLoc, StrId, builtins};
-use plank_values::{Field, StructInfo, StructView, Type, TypeId, Value};
+use plank_values::{Field, MixedComptimeAndRuntime, StructKey, StructView, Type, TypeId, Value};
 
 impl<'eval, 'ctx> Scope<'eval, 'ctx> {
     pub(crate) fn eval_struct_def(
@@ -35,11 +35,6 @@ impl<'eval, 'ctx> Scope<'eval, 'ctx> {
                     fields_poisoned = true;
                     continue;
                 };
-                if ty == TypeId::NEVER {
-                    this.diag_ctx.emit_never_as_struct_field(this.loc(field_def_span), field.name);
-                    fields_poisoned = true;
-                    continue;
-                }
                 if let Some(first_offset) = fields[..i].iter().find_map(|prev_field| {
                     (prev_field.name == field.name).then_some(prev_field.name_offset)
                 }) {
@@ -58,12 +53,22 @@ impl<'eval, 'ctx> Scope<'eval, 'ctx> {
                 return Err(Poisoned);
             }
 
-            let r#struct = this.eval.types.intern_struct(StructInfo {
+            let (r#struct, ok) = this.eval.types.intern_struct(StructKey {
                 def_loc: this.loc(def_expr_span),
                 type_index: type_index?,
                 fields: &this.eval.fields_buf[fields_buf_offset..],
             });
-            Ok(r#struct.into())
+
+            if let Err(MixedComptimeAndRuntime) = ok {
+                this.diag_ctx.emit_mixed_struct_type(
+                    this.loc(def_expr_span),
+                    r#struct,
+                    this.eval.values,
+                );
+                return Err(Poisoned);
+            }
+
+            Ok(TypeId::from_struct(r#struct))
         })
     }
 

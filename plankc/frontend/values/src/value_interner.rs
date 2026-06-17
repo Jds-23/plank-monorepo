@@ -29,6 +29,7 @@ enum StoredValue {
     Bytes(CBytes),
     Closure { fn_def: FnDefId, def_loc: SrcLoc, captures: CaptureIdx },
     StructVal { ty: TypeId, children: CompoundIdx },
+    TupleVal { ty: TypeId, children: CompoundIdx },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,6 +41,7 @@ pub enum Value<'a> {
     Bytes(CBytes),
     Closure { fn_def: FnDefId, def_loc: SrcLoc, captures: &'a [(ValueId, DefOrigin)] },
     StructVal { ty: TypeId, fields: &'a [ValueId] },
+    TupleVal { ty: TypeId, elements: &'a [ValueId] },
 }
 
 impl Value<'_> {
@@ -52,6 +54,7 @@ impl Value<'_> {
             Value::Bytes(_) => TypeId::CBYTES,
             Value::Closure { .. } => TypeId::FUNCTION,
             Value::StructVal { ty, .. } => *ty,
+            Value::TupleVal { ty, .. } => *ty,
         }
     }
 }
@@ -90,6 +93,9 @@ fn stored_to_value<'a>(
         }
         StoredValue::StructVal { ty, children: idx } => {
             Value::StructVal { ty, fields: &children[idx] }
+        }
+        StoredValue::TupleVal { ty, children: idx } => {
+            Value::TupleVal { ty, elements: &children[idx] }
         }
     }
 }
@@ -182,6 +188,10 @@ impl ValueInterner {
                         ty,
                         children: self.children.push_copy_slice(fields),
                     },
+                    Value::TupleVal { ty, elements } => StoredValue::TupleVal {
+                        ty,
+                        children: self.children.push_copy_slice(elements),
+                    },
                 };
                 let id = self.values.push(stored);
                 vacant.insert(id);
@@ -255,6 +265,23 @@ impl FmtValue<'_> {
                 }
                 if fields.is_empty() { f.write_str("}") } else { f.write_str(" }") }
             }
+            Value::TupleVal { ty, elements } => {
+                write!(f, "{} (", self.types.format(self.session, self.values, ty))?;
+                let Type::Tuple(tuple) = self.types.lookup(ty) else {
+                    unreachable!("invariant: tuple value has non-tuple type")
+                };
+                assert_eq!(tuple.elements.len(), elements.len());
+                let mut sep = "";
+                for &element in elements {
+                    f.write_str(sep)?;
+                    sep = ", ";
+                    self.fmt_value(f, element)?;
+                }
+                if elements.len() == 1 {
+                    f.write_str(",")?;
+                }
+                f.write_str(")")
+            }
         }
     }
 }
@@ -285,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn intern_compound_dedup() {
+    fn intern_struct_dedup() {
         let mut interner = ValueInterner::new();
         let v1 = interner.intern(Value::Void);
         let ty = interner.intern(Value::Type(TypeId::new(1)));
@@ -296,6 +323,35 @@ mod tests {
 
         let s3 = interner.intern(Value::StructVal { ty: TypeId::new(2), fields: &[v1, ty] });
         assert_ne!(s1, s3);
+    }
+
+    #[test]
+    fn intern_tuple_dedup() {
+        let mut interner = ValueInterner::new();
+        let v1 = interner.intern(Value::Void);
+        let ty = interner.intern(Value::Type(TypeId::new(1)));
+
+        let t1 = interner.intern(Value::TupleVal { ty: TypeId::new(1), elements: &[v1, ty] });
+        let t2 = interner.intern(Value::TupleVal { ty: TypeId::new(1), elements: &[v1, ty] });
+        assert_eq!(t1, t2);
+
+        let t3 = interner.intern(Value::TupleVal { ty: TypeId::new(2), elements: &[v1, ty] });
+        assert_ne!(t1, t3);
+    }
+
+    #[test]
+    fn intern_compound_dedup() {
+        let mut interner = ValueInterner::new();
+        let v1 = interner.intern(Value::Void);
+        let ty = TypeId::new(1);
+        let ty_value = interner.intern(Value::Type(ty));
+
+        let s = interner.intern(Value::StructVal { ty, fields: &[v1, ty_value] });
+        let t = interner.intern(Value::TupleVal { ty, elements: &[v1, ty_value] });
+
+        assert_ne!(s, t);
+        assert_eq!(interner.lookup(s), Value::StructVal { ty, fields: &[v1, ty_value] });
+        assert_eq!(interner.lookup(t), Value::TupleVal { ty, elements: &[v1, ty_value] });
     }
 
     #[test]

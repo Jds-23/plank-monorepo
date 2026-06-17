@@ -2,7 +2,10 @@ use alloy_primitives::U256;
 use plank_core::{Span, must_use::MustUseStrict};
 use plank_hir::{self as hir, operators::BinaryOp};
 use plank_session::{Builtin, builtins::builtin_names, diagnostic::fmt_count, *};
-use plank_values::{PrimitiveType, TypeId, TypeInterner, ValueInterner, builtins as builtin_sigs};
+use plank_values::{
+    StructRef, TupleRef, Type, TypeFlags, TypeId, TypeInterner, ValueInterner,
+    builtins as builtin_sigs,
+};
 
 pub(crate) struct BindingLoc {
     pub r#use: SrcLoc,
@@ -417,6 +420,95 @@ impl DiagCtx<'_> {
             .emit(self);
     }
 
+    pub fn emit_mixed_tuple_type(&mut self, expr: SrcLoc, tuple: TupleRef, values: &ValueInterner) {
+        let mut runtime_field = None;
+        let mut comptime_field = None;
+        for (i, &field) in self.types.lookup_tuple(tuple).elements.iter().enumerate() {
+            let flags = self.types.lookup(field).flags();
+            if flags.contains(TypeFlags::COMPTIME_ONLY) {
+                comptime_field.get_or_insert((i, field));
+            }
+            if flags.contains(TypeFlags::RUNTIME_ONLY) {
+                runtime_field.get_or_insert((i, field));
+            }
+        }
+        let (runtime_pos, runtime_ty) =
+            runtime_field.expect("mixed should have at least one runtime");
+        let (comptime_pos, comptime_ty) =
+            comptime_field.expect("mixed should have at least one comptime");
+        Diagnostic::error("defining uninstantiable type")
+            .primary(
+                expr.source,
+                expr.span,
+                format!(
+                    "type '{}' of field #{} is runtime only, while type '{}' of field #{} is comptime only",
+                    self.types.format(self.session, values, runtime_ty),
+                    runtime_pos,
+                    self.types.format(self.session, values, comptime_ty),
+                    comptime_pos
+                ),
+            )
+            .emit(self);
+    }
+
+    pub fn emit_mixed_struct_type(
+        &mut self,
+        expr: SrcLoc,
+        r#struct: StructRef,
+        values: &ValueInterner,
+    ) {
+        let mut runtime_field = None;
+        let mut comptime_field = None;
+        for &field in self.types.lookup_struct(r#struct).fields {
+            let flags = self.types.lookup(field.ty).flags();
+            if flags.contains(TypeFlags::COMPTIME_ONLY) {
+                comptime_field.get_or_insert(field);
+            }
+            if flags.contains(TypeFlags::RUNTIME_ONLY) {
+                runtime_field.get_or_insert(field);
+            }
+        }
+        let runtime = runtime_field.expect("mixed should have at least one runtime");
+        let comptime = comptime_field.expect("mixed should have at least one comptime");
+        Diagnostic::error("defining uninstantiable type")
+            .element(
+                Annotations::new(expr.source)
+                    .no_label(expr.span, AnnotationKind::Primary)
+                    .secondary(
+                        runtime.def_span,
+                        format!(
+                            "type '{}' is runtime only",
+                            self.types.format(self.session, values, runtime.ty),
+                        ),
+                    )
+                    .secondary(
+                        comptime.def_span,
+                        format!(
+                            "type '{}' is comptime only",
+                            self.types.format(self.session, values, comptime.ty),
+                        ),
+                    ),
+            )
+            .emit(self);
+    }
+
+    pub fn emit_mixed_comptime_runtime_tuple(
+        &mut self,
+        source: SourceId,
+        tuple_lit_span: SourceSpan,
+        comptime_only_element: SourceSpan,
+        runtime_element: SourceSpan,
+    ) {
+        Diagnostic::error("mixing comptime and runtime data in tuple")
+            .element(
+                Annotations::new(source)
+                    .primary(tuple_lit_span, "mixed tuple literal")
+                    .secondary(comptime_only_element, "tuple element is comptime-only")
+                    .secondary(runtime_element, "tuple element not comptime-known"),
+            )
+            .emit(self);
+    }
+
     pub fn emit_set_field_on_comptime_only_struct(
         &mut self,
         values: &ValueInterner,
@@ -795,39 +887,69 @@ impl DiagCtx<'_> {
             .emit(self.session);
     }
 
-    fn uninit_help() -> String {
-        use builtin_names::*;
-        format!(
-            "{UNINIT} only supports {U256}, {BOOL}, {VOID}, {TYPE}, {CBYTES}, {MEMORY_POINTER} and struct types",
-        )
-    }
-
-    pub fn emit_invalid_uninit_type(&mut self, ty: PrimitiveType, loc: SrcLoc) {
-        Diagnostic::error("cannot create uninitialized value")
-            .primary(loc.source, loc.span, format!("type '{}' cannot be uninitialized", ty.name()))
-            .help(Self::uninit_help())
-            .emit(self);
-    }
-
-    pub fn emit_invalid_uninit_struct_field(
+    pub fn emit_uninit_incompatible_type(
         &mut self,
-        ty: PrimitiveType,
-        loc: SrcLoc,
-        field_loc: SrcLoc,
+        ty: TypeId,
+        expr: SrcLoc,
+        values: &ValueInterner,
     ) {
-        Diagnostic::error("struct contains field that cannot be uninitialized")
-            .primary(
-                loc.source,
-                loc.span,
-                format!("cannot use {} on this struct", builtin_names::UNINIT),
+        use builtin_names::*;
+
+        let diagnostic = match self.types.lookup(ty) {
+            Type::Primitive(primitive) => {
+                assert!(primitive.flags().contains(TypeFlags::UNINIT_INCOMPATIBLE));
+                Diagnostic::error("cannot create uninitialized value").primary(
+                    expr.source,
+                    expr.span,
+                    format!("type '{}' cannot be uninitialized", primitive.name()),
+                )
+            }
+            Type::Struct(r#struct) => {
+                let field = r#struct
+                    .fields
+                    .iter()
+                    .find(|field| {
+                        let r#type = self.types.lookup(field.ty);
+                        r#type.flags().contains(TypeFlags::UNINIT_INCOMPATIBLE)
+                    })
+                    .expect("struct with no fields not uninit incompatible");
+                Diagnostic::error("struct contains field that cannot be uninitialized")
+                    .cross_source_annotations(
+                        expr,
+                        format!("cannot use {} on this struct", builtin_names::UNINIT),
+                        SrcLoc::new(r#struct.def_loc.source, field.def_span),
+                        format!(
+                            "type '{}' cannot be uninitialized",
+                            self.types.format(self.session, values, field.ty)
+                        ),
+                    )
+            }
+            Type::Tuple(tuple) => {
+                let field_pos = tuple
+                    .elements
+                    .iter()
+                    .position(|element| {
+                        let r#type = self.types.lookup(*element);
+                        r#type.flags().contains(TypeFlags::UNINIT_INCOMPATIBLE)
+                    })
+                    .expect("empty tuple not uninit incompatible");
+                let element = tuple.elements[field_pos];
+                Diagnostic::error("tuple contains field that cannot be uninitialized").primary(
+                    expr.source,
+                    expr.span,
+                    format!(
+                        "field {} of type '{}' cannot be uninitialized",
+                        field_pos,
+                        self.types.format(self.session, values, element)
+                    ),
+                )
+            }
+        };
+
+        diagnostic
+            .help(
+                format!("{UNINIT} only supports types that do not contain {NEVER} or {FUNCTION}",),
             )
-            .element(
-                Annotations::new(field_loc.source).secondary(
-                    field_loc.span,
-                    format!("type '{}' cannot be uninitialized", ty.name()),
-                ),
-            )
-            .help(Self::uninit_help())
             .emit(self);
     }
 
@@ -838,17 +960,6 @@ impl DiagCtx<'_> {
         ))
         .primary(loc.source, loc.span, "memptr requires runtime allocation")
         .emit(self);
-    }
-
-    pub fn emit_never_as_struct_field(&mut self, field_def: SrcLoc, name: StrId) {
-        let name = self.session.lookup_name(name);
-        Diagnostic::error(format!("`{}` not valid struct field type", builtin_names::NEVER))
-            .primary(
-                field_def.source,
-                field_def.span,
-                format!("type of `{name}` evaluated to `{}`", builtin_names::NEVER),
-            )
-            .emit(self);
     }
 
     pub fn emit_operator_not_supported(

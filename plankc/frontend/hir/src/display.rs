@@ -49,6 +49,25 @@ impl<'a> DisplayHir<'a> {
         write!(f, ")")
     }
 
+    fn fmt_elements(
+        &self,
+        f: &mut Formatter<'_>,
+        elements_id: ElementsId,
+        open: &str,
+        close: &str,
+    ) -> fmt::Result {
+        let elements = &self.hir.elements[elements_id];
+        write!(f, "{open}")?;
+        for (i, &local) in elements.iter().enumerate() {
+            if i > 0 {
+                write!(f, " ")?;
+            }
+            self.fmt_local(f, local)?;
+            write!(f, ",")?;
+        }
+        write!(f, "{close}")
+    }
+
     fn fmt_expr(&self, f: &mut Formatter<'_>, expr: Expr) -> fmt::Result {
         use ExprKind as Expr;
         match expr.kind {
@@ -78,7 +97,9 @@ impl<'a> DisplayHir<'a> {
                         self.session.lookup_bytes_slice(bytes.contents, bytes.start, bytes.end);
                     write_bytes_literal(f, bytes)
                 }
-                other @ (Value::Closure { .. } | Value::StructVal { .. }) => {
+                other @ (Value::Closure { .. }
+                | Value::StructVal { .. }
+                | Value::TupleVal { .. }) => {
                     unreachable!("unexpected value in HIR: {other:?}")
                 }
             },
@@ -114,6 +135,11 @@ impl<'a> DisplayHir<'a> {
                 write!(f, "}}")
             }
             Expr::StructDef(id) => self.fmt_struct_ref(f, id),
+            Expr::TupleType { elements } => {
+                write!(f, "tuple ")?;
+                self.fmt_elements(f, elements, "{", "}")
+            }
+            Expr::TupleLit { elements } => self.fmt_elements(f, elements, "(", ")"),
             Expr::LogicalNot { input } => {
                 write!(f, "logical_not ")?;
                 self.fmt_local(f, input)
