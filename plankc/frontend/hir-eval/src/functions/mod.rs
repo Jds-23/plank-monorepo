@@ -2,7 +2,7 @@ use plank_core::{DenseIndexMap, IndexVec};
 use plank_hir::{self as hir, ValueId};
 use plank_mir as mir;
 use plank_session::{MaybePoisoned, Poisoned, SourceId, SourceSpan, SrcLoc, StrId, poison};
-use plank_values::{DefOrigin, Type, TypeId, Value};
+use plank_values::{Compound, DefOrigin, Type, TypeId, Value};
 
 mod cache;
 
@@ -221,7 +221,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     pub(crate) fn eval_call(
         &mut self,
         callee: hir::LocalId,
-        args_id: hir::CallArgsId,
+        args_id: hir::ArgsId,
         call_span: SourceSpan,
     ) -> MaybePoisoned<Result<EvalValue, Diverge>> {
         self.with_captures_buf(|this, capture_buf_offset: usize| {
@@ -250,7 +250,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                 }
                 let type_name = this.values.get_closure_name(closure_vid);
 
-                let args = &this.hir.call_args[args_id];
+                let args = &this.hir.args[args_id];
                 let arg_spans = this
                     .eval
                     .call_arg_spans
@@ -680,7 +680,7 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         let Value::Type(ty) = self.values.lookup(value) else {
             return;
         };
-        let Type::Struct(r#struct) = self.types.lookup(ty) else {
+        let Type::Compound(Compound::Struct(r#struct)) = self.types.lookup(ty) else {
             return;
         };
         if r#struct.name.get().is_some() {

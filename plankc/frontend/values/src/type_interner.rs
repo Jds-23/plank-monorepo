@@ -72,18 +72,18 @@ pub struct StructKey<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct TupleView<'a> {
     pub flags: TypeFlags,
-    pub elements: &'a [TypeId],
+    pub fields: &'a [TypeId],
 }
 
 impl<'a> TupleView<'a> {
     fn as_key(self) -> TupleKey<'a> {
-        TupleKey { elements: self.elements }
+        TupleKey { fields: self.fields }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TupleKey<'a> {
-    pub elements: &'a [TypeId],
+    pub fields: &'a [TypeId],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,22 +97,20 @@ enum CompoundKind {
 
 struct TupleHeader {
     flags: TypeFlags,
-    total_elements: u32,
+    total_fields: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum Type<'fields> {
     Primitive(PrimitiveType),
-    Struct(StructView<'fields>),
-    Tuple(TupleView<'fields>),
+    Compound(Compound<'fields>),
 }
 
-impl Type<'_> {
+impl<'a> Type<'a> {
     pub fn flags(&self) -> TypeFlags {
         match self {
             Type::Primitive(p) => p.flags(),
-            Type::Struct(r#struct) => r#struct.flags,
-            Type::Tuple(tuple) => tuple.flags,
+            Type::Compound(c) => c.flags(),
         }
     }
 }
@@ -240,6 +238,20 @@ impl TypeId {
         TypeId::from_compound(offset.0)
     }
 
+    pub const fn is_tuple(self) -> bool {
+        match self.as_primitive() {
+            Ok(_) => false,
+            Err(compound) => matches!(compound.kind(), CompoundKind::Tuple(_)),
+        }
+    }
+
+    pub const fn is_struct(self) -> bool {
+        match self.as_primitive() {
+            Ok(_) => false,
+            Err(compound) => matches!(compound.kind(), CompoundKind::Struct(_)),
+        }
+    }
+
     pub const fn as_primitive(self) -> Result<PrimitiveType, CompoundRef> {
         match self {
             TypeId::VOID => Ok(PrimitiveType::Void),
@@ -351,17 +363,14 @@ impl TypeInterner {
     pub fn lookup<'s>(&'s self, ty: TypeId) -> Type<'s> {
         match ty.as_primitive() {
             Ok(prim) => Type::Primitive(prim),
-            Err(compound) => match self.lookup_compound(compound) {
-                CompoundView::Struct(view) => Type::Struct(view),
-                CompoundView::Tuple(view) => Type::Tuple(view),
-            },
+            Err(compound) => Type::Compound(self.lookup_compound(compound)),
         }
     }
 
-    fn lookup_compound<'s>(&'s self, compound: CompoundRef) -> CompoundView<'s> {
+    fn lookup_compound<'s>(&'s self, compound: CompoundRef) -> Compound<'s> {
         match compound.kind() {
-            CompoundKind::Struct(r#ref) => CompoundView::Struct(self.lookup_struct(r#ref)),
-            CompoundKind::Tuple(r#ref) => CompoundView::Tuple(self.lookup_tuple(r#ref)),
+            CompoundKind::Struct(r#ref) => Compound::Struct(self.lookup_struct(r#ref)),
+            CompoundKind::Tuple(r#ref) => Compound::Tuple(self.lookup_tuple(r#ref)),
         }
     }
 
@@ -389,16 +398,13 @@ impl TypeInterner {
 
             TupleView {
                 flags: header.flags,
-                elements: core::slice::from_raw_parts(
-                    elements_start,
-                    header.total_elements as usize,
-                ),
+                fields: core::slice::from_raw_parts(elements_start, header.total_fields as usize),
             }
         }
     }
 
     pub fn try_name_struct_parameterized(&self, ty: TypeId, name: StrId, args: &[ValueId]) {
-        let Type::Struct(r#struct) = self.lookup(ty) else {
+        let Type::Compound(Compound::Struct(r#struct)) = self.lookup(ty) else {
             return;
         };
         // Deduped structs may be reached through multiple parameterizations; if this
@@ -449,7 +455,7 @@ impl TypeInterner {
     ) -> fmt::Result {
         let view = self.lookup_tuple(tuple);
         f.write_str("tuple {")?;
-        for (i, &element) in view.elements.iter().enumerate() {
+        for (i, &element) in view.fields.iter().enumerate() {
             if i > 0 {
                 f.write_str(", ")?;
             }
@@ -536,7 +542,7 @@ impl TypeInterner {
 
     fn push_tuple(&self, tuple: TupleKey<'_>) -> (TupleRef, Result<(), MixedComptimeAndRuntime>) {
         let required_space =
-            std::mem::size_of::<TupleHeader>() + std::mem::size_of_val(tuple.elements);
+            std::mem::size_of::<TupleHeader>() + std::mem::size_of_val(tuple.fields);
 
         const {
             assert!(align_of::<TupleHeader>() <= MIN_COMPOUND_ALIGN);
@@ -545,7 +551,7 @@ impl TypeInterner {
         }
 
         let flags = tuple
-            .elements
+            .fields
             .iter()
             .fold(TypeFlags::NONE, |flags, element| flags | self.lookup(*element).flags());
 
@@ -554,13 +560,13 @@ impl TypeInterner {
 
             let elements_start = new_tuple_ptr.byte_add(size_of::<TupleHeader>()) as *mut TypeId;
             let mut element_ptr = elements_start;
-            for &element in tuple.elements {
+            for &element in tuple.fields {
                 element_ptr.write(element);
                 element_ptr = element_ptr.add(1);
             }
 
             let header_ptr = new_tuple_ptr as *mut TupleHeader;
-            header_ptr.write(TupleHeader { flags, total_elements: tuple.elements.len() as u32 });
+            header_ptr.write(TupleHeader { flags, total_fields: tuple.fields.len() as u32 });
 
             debug_assert!(offset.is_multiple_of(MIN_COMPOUND_ALIGN as u32));
             TupleRef(CompoundRef::new_tuple(offset))
@@ -574,16 +580,31 @@ impl TypeInterner {
     }
 }
 
-enum CompoundView<'a> {
+#[derive(Debug, Clone, Copy)]
+pub enum Compound<'a> {
     Struct(StructView<'a>),
     Tuple(TupleView<'a>),
 }
 
-impl CompoundView<'_> {
+impl Compound<'_> {
+    pub fn field_count(&self) -> usize {
+        match self {
+            Compound::Struct(r#struct) => r#struct.fields.len(),
+            Compound::Tuple(tuple) => tuple.fields.len(),
+        }
+    }
+
+    pub fn field_type(&self, i: usize) -> TypeId {
+        match self {
+            Compound::Struct(r#struct) => r#struct.fields[i].ty,
+            Compound::Tuple(tuple) => tuple.fields[i],
+        }
+    }
+
     pub fn flags(&self) -> TypeFlags {
         match self {
-            CompoundView::Struct(r#struct) => r#struct.flags,
-            CompoundView::Tuple(tuple) => tuple.flags,
+            Compound::Struct(r#struct) => r#struct.flags,
+            Compound::Tuple(tuple) => tuple.flags,
         }
     }
 }
@@ -600,10 +621,10 @@ impl std::fmt::Display for FmtType<'_> {
         match self.ty.as_primitive() {
             Ok(prim) => write!(f, "{}", prim.name()),
             Err(compound) => match self.types.lookup_compound(compound) {
-                CompoundView::Struct(_) => {
+                Compound::Struct(_) => {
                     self.types.fmt_struct(f, StructRef(compound), self.sess, self.values)
                 }
-                CompoundView::Tuple(_) => {
+                Compound::Tuple(_) => {
                     self.types.fmt_tuple(f, TupleRef(compound), self.sess, self.values)
                 }
             },
@@ -669,7 +690,7 @@ mod tests {
             assert!(r#struct.0.offset().is_multiple_of(MIN_COMPOUND_ALIGN as u32));
         }
 
-        let (tuple, _) = interner.intern_tuple(TupleKey { elements: &[TypeId::U256] });
+        let (tuple, _) = interner.intern_tuple(TupleKey { fields: &[TypeId::U256] });
         assert!(matches!(tuple.0.kind(), CompoundKind::Tuple(_)));
         assert!(tuple.0.offset().is_multiple_of(MIN_COMPOUND_ALIGN as u32));
     }
@@ -719,14 +740,14 @@ mod tests {
         let interner = TypeInterner::new();
         let elements = [TypeId::U256, TypeId::BOOL];
 
-        let (a, a_status) = interner.intern_tuple(TupleKey { elements: &elements });
-        let (b, b_status) = interner.intern_tuple(TupleKey { elements: &elements });
+        let (a, a_status) = interner.intern_tuple(TupleKey { fields: &elements });
+        let (b, b_status) = interner.intern_tuple(TupleKey { fields: &elements });
         assert_eq!(a, b);
         assert_eq!(a_status, Ok(()));
         assert_eq!(b_status, Ok(()));
 
         let different = [TypeId::BOOL, TypeId::U256];
-        let (c, c_status) = interner.intern_tuple(TupleKey { elements: &different });
+        let (c, c_status) = interner.intern_tuple(TupleKey { fields: &different });
         assert_ne!(a, c);
         assert_eq!(c_status, Ok(()));
     }
@@ -734,13 +755,15 @@ mod tests {
     #[test]
     fn empty_tuple_is_not_void() {
         let interner = TypeInterner::new();
-        let (tuple, status) = interner.intern_tuple(TupleKey { elements: &[] });
+        let (tuple, status) = interner.intern_tuple(TupleKey { fields: &[] });
         assert_eq!(status, Ok(()));
         let tuple_ty = TypeId::from_tuple(tuple);
 
         assert_ne!(tuple_ty, TypeId::VOID);
-        let Type::Tuple(view) = interner.lookup(tuple_ty) else { panic!("expected tuple type") };
-        assert!(view.elements.is_empty());
+        let Type::Compound(Compound::Tuple(tuple)) = interner.lookup(tuple_ty) else {
+            panic!("expected tuple type")
+        };
+        assert!(tuple.fields.is_empty());
     }
 
     #[test]
@@ -748,12 +771,12 @@ mod tests {
         let interner = TypeInterner::new();
 
         let (comptime_tuple, comptime_status) =
-            interner.intern_tuple(TupleKey { elements: &[TypeId::TYPE] });
+            interner.intern_tuple(TupleKey { fields: &[TypeId::TYPE] });
         assert_eq!(comptime_status, Ok(()));
         assert!(interner.is_comptime_only(TypeId::from_tuple(comptime_tuple)));
 
         let (runtime_tuple, runtime_status) =
-            interner.intern_tuple(TupleKey { elements: &[TypeId::U256] });
+            interner.intern_tuple(TupleKey { fields: &[TypeId::U256] });
         assert_eq!(runtime_status, Ok(()));
         assert!(!interner.is_comptime_only(TypeId::from_tuple(runtime_tuple)));
     }
@@ -778,11 +801,9 @@ mod tests {
         assert_eq!(first_struct_status, Err(MixedComptimeAndRuntime));
         assert_eq!(second_struct_status, Ok(()));
 
-        let elements = [TypeId::MEMORY_POINTER, TypeId::TYPE];
-        let (first_tuple, first_tuple_status) =
-            interner.intern_tuple(TupleKey { elements: &elements });
-        let (second_tuple, second_tuple_status) =
-            interner.intern_tuple(TupleKey { elements: &elements });
+        let fields = &[TypeId::MEMORY_POINTER, TypeId::TYPE];
+        let (first_tuple, first_tuple_status) = interner.intern_tuple(TupleKey { fields });
+        let (second_tuple, second_tuple_status) = interner.intern_tuple(TupleKey { fields });
         assert_eq!(first_tuple, second_tuple);
         assert_eq!(first_tuple_status, Err(MixedComptimeAndRuntime));
         assert_eq!(second_tuple_status, Ok(()));
@@ -795,7 +816,7 @@ mod tests {
         let field = Field { name: sess.intern("name"), ty: TypeId::U256, def_span: ZERO_SPAN };
 
         let (r#struct, struct_status) = interner.intern_struct(dummy_struct_info(&[field]));
-        let (tuple, tuple_status) = interner.intern_tuple(TupleKey { elements: &[TypeId::U256] });
+        let (tuple, tuple_status) = interner.intern_tuple(TupleKey { fields: &[TypeId::U256] });
         assert_eq!(struct_status, Ok(()));
         assert_eq!(tuple_status, Ok(()));
 

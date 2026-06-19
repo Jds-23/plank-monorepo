@@ -3,7 +3,7 @@ use plank_core::{Span, must_use::MustUseStrict};
 use plank_hir::{self as hir, operators::BinaryOp};
 use plank_session::{Builtin, builtins::builtin_names, diagnostic::fmt_count, *};
 use plank_values::{
-    StructRef, TupleRef, Type, TypeFlags, TypeId, TypeInterner, ValueInterner,
+    Compound, StructRef, TupleRef, Type, TypeFlags, TypeId, TypeInterner, ValueInterner,
     builtins as builtin_sigs,
 };
 
@@ -423,7 +423,7 @@ impl DiagCtx<'_> {
     pub fn emit_mixed_tuple_type(&mut self, expr: SrcLoc, tuple: TupleRef, values: &ValueInterner) {
         let mut runtime_field = None;
         let mut comptime_field = None;
-        for (i, &field) in self.types.lookup_tuple(tuple).elements.iter().enumerate() {
+        for (i, &field) in self.types.lookup_tuple(tuple).fields.iter().enumerate() {
             let flags = self.types.lookup(field).flags();
             if flags.contains(TypeFlags::COMPTIME_ONLY) {
                 comptime_field.get_or_insert((i, field));
@@ -441,7 +441,7 @@ impl DiagCtx<'_> {
                 expr.source,
                 expr.span,
                 format!(
-                    "type '{}' of field #{} is runtime only, while type '{}' of field #{} is comptime only",
+                    "type `{}` of field #{} is runtime only, while type `{}` of field #{} is comptime only",
                     self.types.format(self.session, values, runtime_ty),
                     runtime_pos,
                     self.types.format(self.session, values, comptime_ty),
@@ -477,14 +477,14 @@ impl DiagCtx<'_> {
                     .secondary(
                         runtime.def_span,
                         format!(
-                            "type '{}' is runtime only",
+                            "type `{}` is runtime only",
                             self.types.format(self.session, values, runtime.ty),
                         ),
                     )
                     .secondary(
                         comptime.def_span,
                         format!(
-                            "type '{}' is comptime only",
+                            "type `{}` is comptime only",
                             self.types.format(self.session, values, comptime.ty),
                         ),
                     ),
@@ -509,22 +509,30 @@ impl DiagCtx<'_> {
             .emit(self);
     }
 
-    pub fn emit_set_field_on_comptime_only_struct(
+    pub fn emit_set_field_on_comptime_only(
         &mut self,
         values: &ValueInterner,
-        struct_ty: TypeId,
+        ty: TypeId,
         value_loc: SrcLoc,
-        struct_def_loc: SrcLoc,
+        info: Compound<'_>,
     ) {
-        let struct_name = self.types.format(self.session, values, struct_ty);
-        Diagnostic::error("mixing comptime and runtime data in struct")
-            .cross_source_annotations(
-                value_loc,
-                "this value is only known at runtime",
-                struct_def_loc,
-                format!("`{struct_name}` is comptime-only"),
-            )
-            .emit(self);
+        let diagnostic = Diagnostic::error("mixing comptime and runtime data in compound type");
+        let is_comptime_only_msg =
+            format!("`{}` is a comptime-only type", self.types.format(self.session, values, ty));
+        match info {
+            Compound::Struct(r#struct) => diagnostic
+                .cross_source_annotations(
+                    value_loc,
+                    "this value is only known at runtime",
+                    r#struct.def_loc,
+                    is_comptime_only_msg,
+                )
+                .emit(self),
+            Compound::Tuple(_) => diagnostic
+                .primary(value_loc.source, value_loc.span, "this value is only know at runtime")
+                .note(is_comptime_only_msg)
+                .emit(self),
+        }
     }
 
     fn format_signatures_note(&self, values: &ValueInterner, builtin: Builtin) -> Option<String> {
@@ -744,19 +752,19 @@ impl DiagCtx<'_> {
             .emit(self);
     }
 
-    pub fn emit_expected_struct_type_arg(
+    pub fn emit_expected_compound_type_arg(
         &mut self,
         values: &ValueInterner,
         builtin: Builtin,
         actual_ty: TypeId,
         loc: SrcLoc,
     ) {
-        Diagnostic::error("expected struct type")
+        Diagnostic::error("unexpected type kind")
             .primary(
                 loc.source,
                 loc.span,
                 format!(
-                    "`{builtin}` expects a struct type, got `{}`",
+                    "`{builtin}` expects a struct or tuple type, got `{}`",
                     self.types.format(self.session, values, actual_ty),
                 ),
             )
@@ -794,7 +802,7 @@ impl DiagCtx<'_> {
                 loc.source,
                 loc.span,
                 format!(
-                    "`{builtin}`: field index {index} is out of bounds for struct with {}",
+                    "`{builtin}`: field index {index} is out of bounds for type with {}",
                     fmt_count(field_count, "field"),
                 ),
             )
@@ -901,10 +909,10 @@ impl DiagCtx<'_> {
                 Diagnostic::error("cannot create uninitialized value").primary(
                     expr.source,
                     expr.span,
-                    format!("type '{}' cannot be uninitialized", primitive.name()),
+                    format!("type `{}` cannot be uninitialized", primitive.name()),
                 )
             }
-            Type::Struct(r#struct) => {
+            Type::Compound(Compound::Struct(r#struct)) => {
                 let field = r#struct
                     .fields
                     .iter()
@@ -919,26 +927,26 @@ impl DiagCtx<'_> {
                         format!("cannot use {} on this struct", builtin_names::UNINIT),
                         SrcLoc::new(r#struct.def_loc.source, field.def_span),
                         format!(
-                            "type '{}' cannot be uninitialized",
+                            "type `{}` cannot be uninitialized",
                             self.types.format(self.session, values, field.ty)
                         ),
                     )
             }
-            Type::Tuple(tuple) => {
+            Type::Compound(Compound::Tuple(tuple)) => {
                 let field_pos = tuple
-                    .elements
+                    .fields
                     .iter()
                     .position(|element| {
                         let r#type = self.types.lookup(*element);
                         r#type.flags().contains(TypeFlags::UNINIT_INCOMPATIBLE)
                     })
                     .expect("empty tuple not uninit incompatible");
-                let element = tuple.elements[field_pos];
+                let element = tuple.fields[field_pos];
                 Diagnostic::error("tuple contains field that cannot be uninitialized").primary(
                     expr.source,
                     expr.span,
                     format!(
-                        "field {} of type '{}' cannot be uninitialized",
+                        "field {} of type `{}` cannot be uninitialized",
                         field_pos,
                         self.types.format(self.session, values, element)
                     ),

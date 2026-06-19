@@ -1161,6 +1161,51 @@ fn test_comptime_is_struct() {
 }
 
 #[test]
+fn test_comptime_is_tuple_expects_type() {
+    assert_diagnostics(
+        r#"
+        const x = @is_tuple(42);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: expected type argument
+         --> main.plk:1:11
+          |
+        1 | const x = @is_tuple(42);
+          |           ^^^^^^^^^^^^^ `@is_tuple` expects a type argument, got a value of type `u256`
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_is_tuple() {
+    assert_lowers_to(
+        r#"
+        const Pair = struct { a: u256, b: bool };
+        const yes = @is_tuple(tuple { u256, bool });
+        const struct_no = @is_tuple(Pair);
+        const primitive_no = @is_tuple(u256);
+        init {
+            let mut x: bool = yes;
+            let mut y: bool = struct_no;
+            let mut z: bool = primitive_no;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : bool = true
+            %1 : bool = false
+            %2 : bool = false
+            %3 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
 fn test_comptime_field_count_expects_type() {
     assert_diagnostics(
         r#"
@@ -1185,11 +1230,11 @@ fn test_comptime_field_count_expects_struct() {
         init { @evm_stop(); }
         "#,
         &[r#"
-        error: expected struct type
+        error: unexpected type kind
          --> main.plk:1:11
           |
         1 | const x = @field_count(u256);
-          |           ^^^^^^^^^^^^^^^^^^ `@field_count` expects a struct type, got `u256`
+          |           ^^^^^^^^^^^^^^^^^^ `@field_count` expects a struct or tuple type, got `u256`
         "#],
     );
 }
@@ -1249,11 +1294,11 @@ fn test_comptime_field_type_expects_struct() {
         init { @evm_stop(); }
         "#,
         &[r#"
-        error: expected struct type
+        error: unexpected type kind
          --> main.plk:1:11
           |
         1 | const T = @field_type(u256, 0);
-          |           ^^^^^^^^^^^^^^^^^^^^ `@field_type` expects a struct type, got `u256`
+          |           ^^^^^^^^^^^^^^^^^^^^ `@field_type` expects a struct or tuple type, got `u256`
         "#],
     );
 }
@@ -1325,7 +1370,7 @@ fn test_comptime_get_field_out_of_bounds() {
          --> main.plk:3:27
           |
         3 | const val = @get_field(s, 3);
-          |                           ^ `@get_field`: field index 3 is out of bounds for struct with 1 field
+          |                           ^ `@get_field`: field index 3 is out of bounds for type with 1 field
         "#],
     );
 }
@@ -1344,7 +1389,7 @@ fn test_comptime_get_field_index_overflow() {
          --> main.plk:3:27
           |
         3 | const val = @get_field(s, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF);
-          |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `@get_field`: field index 115792089237316195423570985008687907853269984665640564039457584007913129639935 is out of bounds for struct with 1 field
+          |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `@get_field`: field index 115792089237316195423570985008687907853269984665640564039457584007913129639935 is out of bounds for type with 1 field
         "#],
     );
 }
@@ -1381,11 +1426,11 @@ fn test_get_field_non_struct_instance() {
         }
         "#,
         &[r#"
-        error: expected struct type
+        error: unexpected type kind
          --> main.plk:3:15
           |
         3 |     let val = @get_field(x, 0);
-          |               ^^^^^^^^^^^^^^^^ `@get_field` expects a struct type, got `u256`
+          |               ^^^^^^^^^^^^^^^^ `@get_field` expects a struct or tuple type, got `u256`
         "#],
     );
 }
@@ -1563,11 +1608,11 @@ fn test_set_field_comptime_only_struct_runtime_value() {
         }
         "#,
         &[r#"
-        error: mixing comptime and runtime data in struct
+        error: mixing comptime and runtime data in compound type
          --> main.plk:5:31
           |
         1 | const Wrapper = struct { t: type, n: u256 };
-          |                 --------------------------- `Wrapper` is comptime-only
+          |                 --------------------------- `Wrapper` is a comptime-only type
         ...
         5 |     let w2 = @set_field(w, 1, v);
           |                               ^ this value is only known at runtime
@@ -1660,7 +1705,7 @@ fn test_uninit_invalid_type() {
          --> main.plk:1:11
           |
         1 | const x = @uninit(never);
-          |           ^^^^^^^^^^^^^^ type 'never' cannot be uninitialized
+          |           ^^^^^^^^^^^^^^ type `never` cannot be uninitialized
           |
           = help: @uninit only supports types that do not contain never or function
         "#],
@@ -1682,10 +1727,10 @@ fn test_uninit_tuple() {
         ==== Functions ====
         ; init
         @fn0() -> never {
-            %0 : tuple {u256, bool} = tuple {u256, bool} (
+            %0 : tuple {u256, bool} = tuple {u256, bool} {
                 0,
                 false,
-            )
+            }
             %1 : never = @evm_stop()
         }
         "#,
@@ -1725,7 +1770,7 @@ fn test_uninit_struct_with_function_field() {
          --> main.plk:2:11
           |
         1 | const Bad = struct { a: u256, b: function };
-          |                               ----------- type 'function' cannot be uninitialized
+          |                               ----------- type `function` cannot be uninitialized
         2 | const x = @uninit(Bad);
           |           ^^^^^^^^^^^^ cannot use @uninit on this struct
           |
@@ -1747,7 +1792,7 @@ fn test_uninit_struct_with_invalid_tuple_field() {
          --> main.plk:2:11
           |
         1 | const Bad = struct { a: u256, b: tuple { function } };
-          |                               --------------------- type 'tuple {function}' cannot be uninitialized
+          |                               --------------------- type `tuple {function}` cannot be uninitialized
         2 | const x = @uninit(Bad);
           |           ^^^^^^^^^^^^ cannot use @uninit on this struct
           |
@@ -1845,7 +1890,7 @@ fn test_uninit_struct_with_memptr_and_invalid_field_reports_invalid_field() {
          --> main.plk:3:11
           |
         1 | const Bad = struct { ptr: memptr, f: never };
-          |                                   -------- type 'never' cannot be uninitialized
+          |                                   -------- type `never` cannot be uninitialized
         2 |
         3 | const x = @uninit(Bad);
           |           ^^^^^^^^^^^^ cannot use @uninit on this struct
@@ -1868,7 +1913,7 @@ fn test_uninit_struct_reports_all_invalid_fields() {
          --> main.plk:2:11
           |
         1 | const Bad = struct { f: function, g: function };
-          |                      ----------- type 'function' cannot be uninitialized
+          |                      ----------- type `function` cannot be uninitialized
         2 | const x = @uninit(Bad);
           |           ^^^^^^^^^^^^ cannot use @uninit on this struct
           |

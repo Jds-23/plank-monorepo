@@ -49,7 +49,7 @@ impl<'a> DisplayMir<'a> {
                 }
             }
             Value::Void => write!(f, "void_unit"),
-            Value::StructVal { ty, fields } => {
+            Value::Compound { ty, fields } => {
                 self.fmt_type(f, ty)?;
                 write!(f, " {{")?;
                 if !fields.is_empty() {
@@ -61,19 +61,6 @@ impl<'a> DisplayMir<'a> {
                     writeln!(f, ",")?;
                 }
                 write!(f, "{pad}}}")
-            }
-            Value::TupleVal { ty, elements } => {
-                self.fmt_type(f, ty)?;
-                write!(f, " (")?;
-                if !elements.is_empty() {
-                    writeln!(f)?;
-                }
-                for &element in elements {
-                    write!(f, "{pad}{PAD}")?;
-                    self.fmt_value(f, element, indent + 1)?;
-                    writeln!(f, ",")?;
-                }
-                write!(f, "{pad})")
             }
             Value::Type(_) | Value::Bytes(_) | Value::Closure { .. } => {
                 unreachable!("comptime-only value in MIR")
@@ -97,7 +84,7 @@ impl<'a> DisplayMir<'a> {
                 self.fmt_local(f, object)?;
                 write!(f, ".{field_index}")
             }
-            Expr::StructLit { ty, fields } => {
+            Expr::CompoundLit { ty, fields } => {
                 self.fmt_type(f, ty)?;
                 write!(f, " {{")?;
                 let args = &self.mir.args[fields];
@@ -123,22 +110,6 @@ impl<'a> DisplayMir<'a> {
                     write!(f, " + {start}")?;
                 }
                 Ok(())
-            }
-            Expr::TupleLit { ty, elements } => {
-                self.fmt_type(f, ty)?;
-                write!(f, " (")?;
-                let args = &self.mir.args[elements];
-                for (i, &local) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ",")?;
-                    }
-                    write!(f, " ")?;
-                    self.fmt_local(f, local)?;
-                }
-                if !args.is_empty() {
-                    write!(f, " ")?;
-                }
-                write!(f, ")")
             }
         }
     }

@@ -208,10 +208,9 @@ impl<'a> FunctionLowerer<'a> {
                     return BlockExit::Terminated;
                 }
             }
-            Expr::StructLit { ty, fields: children }
-            | Expr::TupleLit { ty, elements: children } => {
-                let value = self.build_aggregate(ty, self.mir.args[children].len(), |this, i| {
-                    this.read_local(this.mir.args[children][i])
+            Expr::CompoundLit { ty, fields } => {
+                let value = self.build_aggregate(ty, self.mir.args[fields].len(), |this, i| {
+                    this.read_local(this.mir.args[fields][i])
                 });
                 self.write_local(target, value);
             }
@@ -343,8 +342,7 @@ impl<'a> FunctionLowerer<'a> {
         mut get_element: impl FnMut(&mut Self, usize) -> Option<SonaValueId>,
     ) -> Option<SonaValueId> {
         let expected_count = match self.mir.types.lookup(ty) {
-            PlankType::Struct(struct_) => struct_.fields.len(),
-            PlankType::Tuple(tuple) => tuple.elements.len(),
+            PlankType::Compound(compound) => compound.field_count(),
             PlankType::Primitive(_) => panic!("aggregate on primitive"),
         };
         assert_eq!(expected_count, element_count);
@@ -365,10 +363,10 @@ impl<'a> FunctionLowerer<'a> {
 
     fn read_field(&mut self, object: mir::LocalId, field_index: u32) -> Option<SonaValueId> {
         let object_type = self.mir.fn_locals[self.fn_id][object.idx()];
-        let PlankType::Struct(struct_) = self.mir.types.lookup(object_type) else {
-            panic!("field access on non-struct");
+        let PlankType::Compound(compound) = self.mir.types.lookup(object_type) else {
+            panic!("field access on non-compound");
         };
-        let field_ty = self.shape(struct_.fields[field_index as usize].ty)?;
+        let field_ty = self.shape(compound.field_type(field_index as usize))?;
         let object_value = self.read_value(object);
         let idx = self.imm_256(field_index);
         Some(self.fb.insert_inst(ExtractValue::new_unchecked(self.is, object_value, idx), field_ty))
@@ -385,12 +383,8 @@ impl<'a> FunctionLowerer<'a> {
                     self.fb.make_imm_value(Immediate::from_i256(I256::from(value), SonaType::I256)),
                 )
             }
-            Value::StructVal { ty, fields: children }
-            | Value::TupleVal { ty, elements: children } => {
-                self.build_aggregate(ty, children.len(), |this, i| {
-                    this.materialize_constant(children[i])
-                })
-            }
+            Value::Compound { ty, fields } => self
+                .build_aggregate(ty, fields.len(), |this, i| this.materialize_constant(fields[i])),
             Value::Type(_) | Value::Bytes(_) | Value::Closure { .. } => {
                 panic!("comptime-only value in MIR")
             }
