@@ -1206,6 +1206,85 @@ fn test_comptime_is_tuple() {
 }
 
 #[test]
+fn test_comptime_type_index_expects_type() {
+    assert_diagnostics(
+        r#"
+        const x = @type_index(42);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: expected type argument
+         --> main.plk:1:11
+          |
+        1 | const x = @type_index(42);
+          |           ^^^^^^^^^^^^^^^ `@type_index` expects a type argument, got a value of type `u256`
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_type_index_expects_struct() {
+    assert_diagnostics(
+        r#"
+        const x = @type_index(u256);
+        init { @evm_stop(); }
+        "#,
+        &[r#"
+        error: unexpected type kind
+         --> main.plk:1:11
+          |
+        1 | const x = @type_index(u256);
+          |           ^^^^^^^^^^^^^^^^^ `@type_index` expects a struct type, got `u256`
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_type_index() {
+    assert_lowers_to(
+        r#"
+        const Numeric = struct 42 { a: u256 };
+        const Flagged = struct true { a: u256 };
+        const numeric = @type_index(Numeric);
+        const flagged = @type_index(Flagged);
+        init {
+            let mut x: u256 = numeric;
+            let mut y: bool = flagged;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 42
+            %1 : bool = true
+            %2 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_comptime_type_index_default_is_void() {
+    assert_lowers_to(
+        r#"
+        const Default = struct { a: u256 };
+        const index = @type_index(Default);
+        const check: void = index;
+        init { @evm_stop(); }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
 fn test_comptime_field_count_expects_type() {
     assert_diagnostics(
         r#"
