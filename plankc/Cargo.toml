@@ -9,15 +9,14 @@ license = "MIT"
 
 [profile.release-safe]
 inherits = "release"
-debug-assertions = true
+overflow-checks = true
+debug-assertions = false
 
 [profile.profiling]
 inherits = "release"
 # Keep optimized code, but retain enough debug info for useful stacks.
 debug = true
 strip = false
-# Makes sampling stack traces much more reliable.
-incremental = false
 
 [profile.test.package.proptest]
 opt-level = 3
