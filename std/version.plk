@@ -1,0 +1,9 @@
+const EvmVersion =  struct { id: u256 };
+
+const CANCUN = EvmVersion { id: 11 };
+const PRAGUE = EvmVersion { id: 12 };
+const OSAKA = EvmVersion { id: 13 };
+
+const active_evm_version = fn () EvmVersion {
+    EvmVersion { id: @active_evm_version() }
+};

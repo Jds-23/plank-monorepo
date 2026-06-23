@@ -6,6 +6,7 @@ use tempfile as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use owo_colors::OwoColorize;
 use plank_driver::{BackendKind, Driver};
+use plank_evm::EvmVersion;
 use plank_hir::display::DisplayHir;
 use plank_mir::display::DisplayMir;
 use plank_parser::cst::display::DisplayCST;
@@ -79,8 +80,28 @@ struct BuildArgs {
     #[arg(long = "module-root", requires = "module_name")]
     module_root: Option<String>,
 
+    #[arg(long = "evm-version", value_enum, default_value_t = EvmVersionArg::Osaka)]
+    evm_version: EvmVersionArg,
+
     #[arg(long = "dep", value_parser = parse_dep)]
     deps: Vec<(String, PathBuf)>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EvmVersionArg {
+    Cancun,
+    Prague,
+    Osaka,
+}
+
+impl From<EvmVersionArg> for EvmVersion {
+    fn from(value: EvmVersionArg) -> Self {
+        match value {
+            EvmVersionArg::Cancun => EvmVersion::Cancun,
+            EvmVersionArg::Prague => EvmVersion::Prague,
+            EvmVersionArg::Osaka => EvmVersion::Osaka,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -238,7 +259,7 @@ fn build(plank_dir: Option<PathBuf>, args: BuildArgs) {
         eprintln!("{}", DisplayHir::new(&hir, &driver.values, &driver.session));
     }
 
-    let mir = driver.evaluate_hir(&hir, project.core_ops_source);
+    let mir = driver.evaluate_hir(&hir, project.core_ops_source, args.evm_version.into());
 
     if args.show_mir {
         if needs_separators {

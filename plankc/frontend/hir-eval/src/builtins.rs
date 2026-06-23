@@ -372,6 +372,10 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
                     result_type: TypeId::U256,
                 }))
             }
+            Builtin::ActiveEvmVersion => {
+                let evm_version: U256 = self.eval.evm_version.into();
+                Ok(Ok(EvalValue::Comptime(self.eval.values.intern_num(evm_version))))
+            }
             _ => unreachable!("not a comptime builtin: {builtin}"),
         }
     }

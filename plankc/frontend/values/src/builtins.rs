@@ -233,6 +233,7 @@ pub fn builtin_signatures(builtin: Builtin) -> &'static [BuiltinSignature] {
         B::InComptime => &[sig!([=> BOOL])],
         B::SetEvalBranchQuota => &[sig!([U256 => VOID])],
         B::CompileError => &[sig!([CBYTES => NEVER])],
+        B::ActiveEvmVersion => &[sig!([=> U256])],
 
         // Comptime dynamic — no fixed signatures
         B::FieldType | B::TypeIndex | B::GetField | B::SetField | B::Uninit | B::ConcatCBytes => {

@@ -371,6 +371,7 @@ define_builtins! {
         IN_COMPTIME "@in_comptime" => InComptime;
         SET_EVAL_BRANCH_QUOTA "@set_eval_branch_quota" => SetEvalBranchQuota;
         COMPILE_ERROR "@compile_error" => CompileError;
+        ACTIVE_EVM_VERSION "@active_evm_version" => ActiveEvmVersion;
     }
 
     comptime_dynamic_builtins {

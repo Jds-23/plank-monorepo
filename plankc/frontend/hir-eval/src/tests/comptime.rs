@@ -148,6 +148,27 @@ fn test_comptime_evm_const_chain() {
 }
 
 #[test]
+fn test_comptime_active_evm_version_builtin() {
+    assert_lowers_to(
+        r#"
+        const a = @active_evm_version();
+        init {
+            let mut x: u256 = a;
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 13
+            %1 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
 fn test_comptime_unsupported_evm_builtin() {
     assert_diagnostics(
         r#"

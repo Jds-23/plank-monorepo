@@ -1,6 +1,7 @@
 use plank_core::{
     DenseIndexMap, IndexVec, dense_index_map::Entry, list_of_lists::ListOfLists, newtype_index,
 };
+use plank_evm::EvmVersion;
 use plank_hir::{self as hir, ConstId, Hir};
 use plank_mir as mir;
 use plank_session::{MaybePoisoned, Poisoned, SourceSpan, SrcLoc, StrId, ZERO_SPAN};
@@ -68,6 +69,8 @@ pub(crate) struct Evaluator<'a> {
     pub type_name_args_buf: Vec<ValueId>,
     pub fields_buf: Vec<Field>,
     pub captures_buf: Vec<(ValueId, DefOrigin)>,
+
+    pub evm_version: EvmVersion,
 }
 
 impl<'a> Evaluator<'a> {
@@ -76,6 +79,7 @@ impl<'a> Evaluator<'a> {
         types: &'a TypeInterner,
         evaluated_fns_cache: &'a EvaluatedFunctionCache,
         values: &'a mut ValueInterner,
+        evm_version: EvmVersion,
     ) -> Self {
         Evaluator {
             mir_blocks: ListOfLists::new(),
@@ -103,6 +107,8 @@ impl<'a> Evaluator<'a> {
             type_name_args_buf: Vec::new(),
             fields_buf: Vec::new(),
             captures_buf: Vec::new(),
+
+            evm_version,
         }
     }
 
