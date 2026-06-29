@@ -1,5 +1,6 @@
 use crate::scope::{Diverge, EvalValue, LocalState, Scope};
 use alloy_primitives::U256;
+use plank_evm::EvmVersion;
 use plank_hir as hir;
 use plank_mir as mir;
 use plank_session::{
@@ -22,6 +23,17 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
         let args = &self.eval.hir.args[args];
         match builtin {
             Builtin::Runtime(runtime) => {
+                if let Some(required) = runtime_builtin_min_evm_version(runtime)
+                    && self.eval.evm_version < required
+                {
+                    self.diag_ctx.emit_builtin_requires_evm_version(
+                        runtime,
+                        self.eval.evm_version,
+                        required,
+                        self.loc(expr_span),
+                    );
+                    return Err(Poisoned);
+                }
                 if runtime.foldable() {
                     self.eval_runtime_foldable_builtin(runtime, args, expr_span)
                 } else {
@@ -963,6 +975,13 @@ impl<'a, 'ctx> Scope<'a, 'ctx> {
     }
 }
 
+fn runtime_builtin_min_evm_version(builtin: RuntimeBuiltin) -> Option<EvmVersion> {
+    match builtin {
+        RuntimeBuiltin::Clz => Some(EvmVersion::Osaka),
+        _ => None,
+    }
+}
+
 pub(crate) fn fold_runtime_builtin(
     builtin: RuntimeBuiltin,
     args: &[ValueId],
@@ -975,6 +994,7 @@ pub(crate) fn fold_runtime_builtin(
             match builtin {
                 RuntimeBuiltin::IsZero => U256::from(plank_evm::iszero(a)),
                 RuntimeBuiltin::Not => plank_evm::not(a),
+                RuntimeBuiltin::Clz => plank_evm::clz(a),
                 _ => unreachable!("not a unary foldable builtin: {builtin}"),
             }
         }
