@@ -3,7 +3,7 @@ use plank_core::{Span, must_use::MustUseStrict};
 use plank_hir::{self as hir, operators::BinaryOp};
 use plank_session::{Builtin, builtins::builtin_names, diagnostic::fmt_count, *};
 use plank_values::{
-    Compound, StructRef, TupleRef, Type, TypeFlags, TypeId, TypeInterner, ValueInterner,
+    Compound, StructRef, TupleRef, Type, TypeFlags, TypeId, TypeInterner, ValueId, ValueInterner,
     builtins as builtin_sigs,
 };
 
@@ -1175,5 +1175,20 @@ impl DiagCtx<'_> {
         Diagnostic::error(format!("failed to resolve core operation handler `{op_name}`"))
             .element(Element::Origin { path: source })
             .emit(self);
+    }
+
+    pub fn emit_found_compile_log(&mut self, first_loc: SrcLoc) {
+        Diagnostic::error("found compile log statement")
+            .element(
+                Annotations::new(first_loc.source)
+                    .no_label(first_loc.span, AnnotationKind::Primary),
+            )
+            .emit(self);
+    }
+
+    // TODO: Code smell due to https://github.com/plankevm/plank-monorepo/issues/253
+    pub fn record_compile_log(&mut self, values: &ValueInterner, value_id: ValueId, loc: SrcLoc) {
+        let msg = values.format_value(self.session, self.types, value_id).to_string();
+        self.session.emit_compile_log(CompileLog { loc, msg });
     }
 }

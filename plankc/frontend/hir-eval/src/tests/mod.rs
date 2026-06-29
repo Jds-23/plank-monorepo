@@ -1,5 +1,6 @@
 mod basic;
 mod calls;
+mod compile_log;
 mod comptime;
 mod logical_ops;
 mod operators;
@@ -57,4 +58,19 @@ fn assert_diagnostics(source: impl Into<TestProject>, expected: &[&str]) {
 fn assert_project_diagnostics(test_project: impl Into<TestProject>, expected: &[&str]) {
     let (_, _, session) = try_lower(test_project);
     plank_test_utils::assert_diagnostics(session.diagnostics(), &session, expected);
+}
+
+#[track_caller]
+fn assert_diagnostics_and_compile_logs(
+    source: impl Into<TestProject>,
+    expected_diagnostics: &[&str],
+    expected_logs: &[&str],
+) {
+    let (_, _, session) = try_lower(source);
+    plank_test_utils::assert_diagnostics(session.diagnostics(), &session, expected_diagnostics);
+
+    let actual_logs: Vec<String> =
+        session.compile_logs().iter().map(|log| log.to_string()).collect();
+    let expected_logs: Vec<String> = expected_logs.iter().map(|s| s.to_string()).collect();
+    pretty_assertions::assert_eq!(actual_logs, expected_logs);
 }
