@@ -396,6 +396,23 @@ impl DiagCtx<'_> {
             .emit(self);
     }
 
+    pub fn emit_comptime_only_value_in_runtime_branch(
+        &mut self,
+        source: SourceId,
+        value_span: SourceSpan,
+        condition_span: SourceSpan,
+    ) {
+        Diagnostic::error("comptime-only value depends on runtime control flow")
+            .element(
+                Annotations::new(source)
+                    .primary(value_span, "comptime-only value")
+                    .secondary(condition_span, "runtime condition here"),
+            )
+            .note("branches with runtime conditions must produce runtime-compatible values")
+            .help("make the condition comptime-known to evaluate only the taken branch")
+            .emit(self);
+    }
+
     pub fn emit_mixed_comptime_runtime_struct(
         &mut self,
         source: SourceId,

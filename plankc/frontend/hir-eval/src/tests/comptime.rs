@@ -595,22 +595,224 @@ fn test_comptime_expr_runtime_dep() {
             @evm_stop();
         }
         "#,
-        &[
-            r#"
-        error: use of comptime-only value at runtime
+        &[r#"
+        error: comptime-only value depends on runtime control flow
          --> main.plk:3:23
           |
         3 |     let T = if cond { u256 } else { bool };
-          |                       ^^^^ reference to comptime-only value
-        "#,
-            r#"
-        error: use of comptime-only value at runtime
-         --> main.plk:3:37
+          |                ----   ^^^^ comptime-only value
+          |                |
+          |                runtime condition here
           |
-        3 |     let T = if cond { u256 } else { bool };
-          |                                     ^^^^ reference to comptime-only value
+          = note: branches with runtime conditions must produce runtime-compatible values
+          = help: make the condition comptime-known to evaluate only the taken branch
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_only_in_then_branch_mixed() {
+    assert_diagnostics(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            let T = if cond { u256 } else { 1 };
+            @evm_stop();
+        }
         "#,
-        ],
+        &[r#"
+        error: comptime-only value depends on runtime control flow
+         --> main.plk:3:23
+          |
+        3 |     let T = if cond { u256 } else { 1 };
+          |                ----   ^^^^ comptime-only value
+          |                |
+          |                runtime condition here
+          |
+          = note: branches with runtime conditions must produce runtime-compatible values
+          = help: make the condition comptime-known to evaluate only the taken branch
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_only_in_else_branch_mixed() {
+    assert_diagnostics(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            let T = if cond { 1 } else { u256 };
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: comptime-only value depends on runtime control flow
+         --> main.plk:3:34
+          |
+        3 |     let T = if cond { 1 } else { u256 };
+          |                ----              ^^^^ comptime-only value
+          |                |
+          |                runtime condition here
+          |
+          = note: branches with runtime conditions must produce runtime-compatible values
+          = help: make the condition comptime-known to evaluate only the taken branch
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_only_nested_runtime_if() {
+    assert_diagnostics(
+        r#"
+        init {
+            let a = @evm_iszero(@evm_calldataload(0));
+            let b = @evm_iszero(@evm_calldataload(32));
+            let T = if a { if b { u256 } else { bool } } else { bool };
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: comptime-only value depends on runtime control flow
+         --> main.plk:4:27
+          |
+        4 |     let T = if a { if b { u256 } else { bool } } else { bool };
+          |                       -   ^^^^ comptime-only value
+          |                       |
+          |                       runtime condition here
+          |
+          = note: branches with runtime conditions must produce runtime-compatible values
+          = help: make the condition comptime-known to evaluate only the taken branch
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_only_short_circuit_and() {
+    assert_diagnostics(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            let x = cond and u256;
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: comptime-only value depends on runtime control flow
+         --> main.plk:3:22
+          |
+        3 |     let x = cond and u256;
+          |             ----     ^^^^ comptime-only value
+          |             |
+          |             runtime condition here
+          |
+          = note: branches with runtime conditions must produce runtime-compatible values
+          = help: make the condition comptime-known to evaluate only the taken branch
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_only_then_branch_implicit_else() {
+    assert_diagnostics(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            let T = if cond { u256 };
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: comptime-only value depends on runtime control flow
+         --> main.plk:3:23
+          |
+        3 |     let T = if cond { u256 };
+          |                ----   ^^^^ comptime-only value
+          |                |
+          |                runtime condition here
+          |
+          = note: branches with runtime conditions must produce runtime-compatible values
+          = help: make the condition comptime-known to evaluate only the taken branch
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_only_short_circuit_or() {
+    assert_diagnostics(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            let x = cond or u256;
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: comptime-only value depends on runtime control flow
+         --> main.plk:3:21
+          |
+        3 |     let x = cond or u256;
+          |             ----    ^^^^ comptime-only value
+          |             |
+          |             runtime condition here
+          |
+          = note: branches with runtime conditions must produce runtime-compatible values
+          = help: make the condition comptime-known to evaluate only the taken branch
+        "#],
+    );
+}
+
+#[test]
+fn test_comptime_if_inside_runtime_branch_ok() {
+    assert_lowers_to(
+        r#"
+        init {
+            let rt = @evm_iszero(@evm_calldataload(0));
+            let T = if rt { if true { 1 } else { 2 } } else { 3 };
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Functions ====
+        ; init
+        @fn0() -> never {
+            %0 : u256 = 0
+            %1 : u256 = @evm_calldataload(%0)
+            %2 : bool = @evm_iszero(%1)
+            %3 : bool = %2
+            if %3 {
+                %4 : u256 = 1
+            } else {
+                %4 : u256 = 3
+            }
+            %5 : u256 = %4
+            %6 : never = @evm_stop()
+        }
+        "#,
+    );
+}
+
+#[test]
+fn test_comptime_if_comptime_only_inside_runtime_branch() {
+    assert_diagnostics(
+        r#"
+        init {
+            let rt = @evm_iszero(@evm_calldataload(0));
+            let T = if rt { if true { u256 } else { bool } } else { 1 };
+            @evm_stop();
+        }
+        "#,
+        &[r#"
+        error: comptime-only value depends on runtime control flow
+         --> main.plk:3:21
+          |
+        3 |     let T = if rt { if true { u256 } else { bool } } else { 1 };
+          |                --   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ comptime-only value
+          |                |
+          |                runtime condition here
+          |
+          = note: branches with runtime conditions must produce runtime-compatible values
+          = help: make the condition comptime-known to evaluate only the taken branch
+        "#],
     );
 }
 
