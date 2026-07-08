@@ -1095,6 +1095,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "comptime_block"
+        },
+        {
+          "type": "SYMBOL",
           "name": "while"
         }
       ]
@@ -1139,6 +1143,18 @@
     "let": {
       "type": "SEQ",
       "members": [
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "comptime"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
         {
           "type": "STRING",
           "value": "let"

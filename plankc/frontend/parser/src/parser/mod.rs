@@ -11,6 +11,21 @@ use plank_core::{Idx, IndexVec, Span, bigint, list_of_lists::ListOfLists};
 use plank_session::{Session, SourceByteOffset, SourceId, SourceSpan, StrId};
 
 const CONST_DEF_EXPR_RECOVERY: &[Token] = &[Token::Init, Token::Run, Token::Const, Token::Import];
+const STMT_RECOVERY: &[Token] = &[
+    Token::Semicolon,
+    Token::RightCurly,
+    Token::Init,
+    Token::Run,
+    Token::Const,
+    Token::Import,
+    Token::Let,
+    Token::Return,
+    Token::Comptime,
+    Token::While,
+    Token::Inline,
+    Token::If,
+    Token::LeftCurly,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct OpPriority(u8);
@@ -229,6 +244,16 @@ impl<'a> Parser<'a> {
             self.emit_unexpected();
         }
         false
+    }
+
+    fn skip_until_recovery_token(&mut self, recovery_tokens: &[Token]) {
+        while !self.eof() {
+            self.skip_trivia();
+            if recovery_tokens.contains(&self.current_token()) {
+                break;
+            }
+            self.advance();
+        }
     }
 
     fn expect(&mut self, token: Token) -> bool {
@@ -814,6 +839,31 @@ impl<'a> Parser<'a> {
         Some(self.close_node(while_stmt))
     }
 
+    fn parse_let_stmt(&mut self, stmt_start: TokenIdx, comptime: bool) -> NodeIdx {
+        let mutable = self.eat(Token::Mut);
+        let mut r#let =
+            self.alloc_node_from(stmt_start, NodeKind::LetStmt { comptime, mutable, typed: false });
+
+        let name = self.expect_ident();
+        self.push_child(&mut r#let, name);
+
+        let typed = self.eat(Token::Colon);
+        if typed {
+            let type_expr = self.parse_expr(ParseExprMode::AllowAll);
+            self.push_child(&mut r#let, type_expr);
+        }
+        self.update_kind(r#let, NodeKind::LetStmt { comptime, mutable, typed });
+
+        self.expect(Token::Equals);
+
+        let assign = self.parse_expr(ParseExprMode::AllowAll);
+        self.push_child(&mut r#let, assign);
+
+        self.expect(Token::Semicolon);
+
+        self.close_node(r#let)
+    }
+
     fn try_parse_stmt(&mut self) -> Option<StmtResult> {
         let stmt_start = self.current_token_index();
         let expected_checkpoint = self.expected.len();
@@ -833,28 +883,31 @@ impl<'a> Parser<'a> {
             return Some(StmtResult::Statement(r#return));
         }
 
-        if self.eat(Token::Let) {
-            let mutable = self.eat(Token::Mut);
-            let mut r#let =
-                self.alloc_node_from(stmt_start, NodeKind::LetStmt { mutable, typed: false });
-
-            let name = self.expect_ident();
-            self.push_child(&mut r#let, name);
-
-            if self.eat(Token::Colon) {
-                self.update_kind(r#let, NodeKind::LetStmt { mutable, typed: true });
-                let type_expr = self.parse_expr(ParseExprMode::AllowAll);
-                self.push_child(&mut r#let, type_expr);
+        if self.eat(Token::Comptime) {
+            if self.check(Token::LeftCurly) {
+                let block = self.parse_block(stmt_start, NodeKind::ComptimeBlock);
+                if self.eat(Token::Semicolon) {
+                    return Some(StmtResult::Statement(block));
+                }
+                return Some(StmtResult::EndExprOrStmt(block));
             }
 
-            self.expect(Token::Equals);
+            if self.eat(Token::Let) {
+                let r#let = self.parse_let_stmt(stmt_start, true);
+                return Some(StmtResult::Statement(r#let));
+            }
 
-            let assign = self.parse_expr(ParseExprMode::AllowAll);
-            self.push_child(&mut r#let, assign);
+            self.emit_unexpected();
+            self.skip_until_recovery_token(STMT_RECOVERY);
+            if self.at(Token::Semicolon) {
+                self.advance();
+            }
+            let error = self.alloc_node_from(stmt_start, NodeKind::Error);
+            return Some(StmtResult::Statement(self.close_node(error)));
+        }
 
-            self.expect(Token::Semicolon);
-
-            let r#let = self.close_node(r#let);
+        if self.eat(Token::Let) {
+            let r#let = self.parse_let_stmt(stmt_start, false);
             return Some(StmtResult::Statement(r#let));
         }
 

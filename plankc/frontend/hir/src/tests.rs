@@ -71,14 +71,14 @@ fn test_basic_init_builtin_calls() {
         ==== Init ====
         %0 = 0
         %1 = @evm_calldataload(%0)
-        %2 = 32
-        %4 = type:u256
-        %3 : %4 = @evm_calldataload(%2)
+        %2 = type:u256
+        %3 = 32
+        %4 : %2 = @evm_calldataload(%3)
         %5 = 32
         %6 = @malloc_uninit(%5)
         %7 = %6
         %8 = %1
-        %9 = %3
+        %9 = %4
         %10 = @evm_add(%8, %9)
         eval @mstore32(%7, %10)
         %11 = %6
@@ -410,10 +410,10 @@ fn test_tuple_type_and_literal() {
         }
 
         ==== Init ====
-        %0 = 2
-        %1 = true
-        %3 = $0
-        %2 : %3 = tuple_value (%0, %1)
+        %0 = $0
+        %1 = 2
+        %2 = true
+        %3 : %0 = tuple_value (%1, %2)
         "#,
     );
 }
@@ -977,24 +977,28 @@ fn test_number_out_of_range() {
 }
 
 #[test]
-fn test_inline_while_not_yet_supported() {
-    let rendered = render_diagnostics(
+fn test_inline_while_lowering() {
+    assert_lowers_to(
         r#"
         init {
-            inline while true {}
+            inline while false {
+                let x = 1;
+            }
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        [inline] while {
+            cond:
+                %0 = false
+            test %0
+            body:
+                %1 = 1
         }
         "#,
     );
-    let expected = dedent_preserve_blank_lines(
-        r#"
-        error: inline while is not yet supported
-         --> main.plk:2:5
-          |
-        2 |     inline while true {}
-          |     ^^^^^^^^^^^^^^^^^^^^ not yet supported
-        "#,
-    );
-    pretty_assertions::assert_str_eq!(rendered.trim(), expected.trim());
 }
 
 #[test]
@@ -1083,7 +1087,7 @@ fn test_and_desugaring() {
         %1 = @evm_calldataload(%0)
         %2 = @evm_iszero(%1)
         %4 = %2
-        if %4 {
+        %3 <- if %4 {
             %5 = $0
             %3 [br]= call %5()
         } else {
@@ -1116,7 +1120,7 @@ fn test_or_desugaring() {
         %1 = @evm_calldataload(%0)
         %2 = @evm_iszero(%1)
         %4 = %2
-        if %4 {
+        %3 <- if %4 {
             %3 [br]= true
         } else {
             %5 = 1

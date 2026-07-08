@@ -97,6 +97,7 @@ pub enum InstructionKind {
         expr: Expr,
     },
     SetMut {
+        comptime: bool,
         local: LocalId,
         r#type: Option<LocalId>,
         expr: Expr,
@@ -108,11 +109,13 @@ pub enum InstructionKind {
     Eval(Expr),
     Return(Expr),
     If {
+        outer_result: Option<LocalId>,
         condition: LocalId,
         then_block: BlockId,
         else_block: BlockId,
     },
     While {
+        inline: bool,
         condition_block: BlockId,
         condition: LocalId,
         body: BlockId,
@@ -120,7 +123,15 @@ pub enum InstructionKind {
     /// Forces compile-time evaluation of the block body.
     ComptimeBlock {
         body: BlockId,
+        reason: ComptimeReason,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComptimeReason {
+    Explicit,
+    LetInitializer,
+    Assign,
 }
 
 #[derive(Debug, Clone, Copy)]

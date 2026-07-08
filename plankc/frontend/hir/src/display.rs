@@ -138,6 +138,7 @@ impl<'a> DisplayHir<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fmt_set(
         &self,
         f: &mut Formatter<'_>,
@@ -146,9 +147,13 @@ impl<'a> DisplayHir<'a> {
         r#type: Option<LocalId>,
         expr: Expr,
         mutable: bool,
+        comptime: bool,
     ) -> fmt::Result {
         let pad = "    ".repeat(indent);
         write!(f, "{pad}")?;
+        if comptime {
+            write!(f, "[comptime] ")?;
+        }
         self.fmt_local(f, local)?;
         if let Some(r#type) = r#type {
             write!(f, " : ")?;
@@ -168,10 +173,10 @@ impl<'a> DisplayHir<'a> {
         let pad = "    ".repeat(indent);
         match instr {
             InstructionKind::Set { local, r#type, expr } => {
-                self.fmt_set(f, indent, local, r#type, expr, false)
+                self.fmt_set(f, indent, local, r#type, expr, false, false)
             }
-            InstructionKind::SetMut { local, r#type, expr } => {
-                self.fmt_set(f, indent, local, r#type, expr, true)
+            InstructionKind::SetMut { comptime, local, r#type, expr } => {
+                self.fmt_set(f, indent, local, r#type, expr, true, comptime)
             }
             InstructionKind::BranchSet { local, expr } => {
                 write!(f, "{pad}")?;
@@ -197,8 +202,13 @@ impl<'a> DisplayHir<'a> {
                 self.fmt_expr(f, expr)?;
                 writeln!(f)
             }
-            InstructionKind::If { condition, then_block, else_block } => {
-                write!(f, "{pad}if ")?;
+            InstructionKind::If { outer_result: result, condition, then_block, else_block } => {
+                write!(f, "{pad}")?;
+                if let Some(result) = result {
+                    self.fmt_local(f, result)?;
+                    write!(f, " <- ")?;
+                }
+                write!(f, "if ")?;
                 self.fmt_local(f, condition)?;
                 writeln!(f, " {{")?;
                 self.fmt_block(f, then_block, indent + 1)?;
@@ -206,8 +216,12 @@ impl<'a> DisplayHir<'a> {
                 self.fmt_block(f, else_block, indent + 1)?;
                 writeln!(f, "{pad}}}")
             }
-            InstructionKind::While { condition_block, condition, body } => {
-                writeln!(f, "{pad}while {{")?;
+            InstructionKind::While { inline, condition_block, condition, body } => {
+                write!(f, "{pad}")?;
+                if inline {
+                    write!(f, "[inline] ")?;
+                }
+                writeln!(f, "while {{")?;
                 writeln!(f, "{pad}    cond:")?;
                 self.fmt_block(f, condition_block, indent + 2)?;
                 write!(f, "{pad}    test ")?;
@@ -217,7 +231,7 @@ impl<'a> DisplayHir<'a> {
                 self.fmt_block(f, body, indent + 2)?;
                 writeln!(f, "{pad}}}")
             }
-            InstructionKind::ComptimeBlock { body } => {
+            InstructionKind::ComptimeBlock { body, reason: _ } => {
                 writeln!(f, "{pad}comptime {{")?;
                 self.fmt_block(f, body, indent + 1)?;
                 writeln!(f, "{pad}}}")

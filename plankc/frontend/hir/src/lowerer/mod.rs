@@ -19,11 +19,24 @@ use plank_source::ParsedProject;
 
 use crate::*;
 
+#[derive(Debug, Clone, Copy)]
+enum LocalKind {
+    Immutable,
+    RuntimeMutable,
+    ComptimeMutable,
+}
+
+impl LocalKind {
+    const fn mutable(self) -> bool {
+        matches!(self, LocalKind::RuntimeMutable | LocalKind::ComptimeMutable)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ScopedLocal {
     name: StrId,
     id: LocalId,
-    mutable: bool,
+    kind: LocalKind,
     span: Option<TokenSpan>,
 }
 
@@ -180,19 +193,24 @@ impl BlockLowerer<'_> {
         debug_assert!(self.captures_buf.is_empty());
     }
 
-    fn alloc_local(&mut self, name: StrId, mutable: bool, span: TokenSpan) -> LocalId {
+    fn alloc_local(&mut self, name: StrId, kind: LocalKind, span: TokenSpan) -> LocalId {
         if TypeId::resolve_primitive(name).is_some() {
             self.error_shadowing_primitive_type(name, span);
         }
 
         let id = self.next_local_id.get_and_inc();
-        self.scoped_locals_stack.push(ScopedLocal { name, id, mutable, span: Some(span) });
+        self.scoped_locals_stack.push(ScopedLocal { name, id, kind, span: Some(span) });
         id
     }
 
     fn alloc_anonymous_local(&mut self, name: StrId) -> LocalId {
         let id = self.next_local_id.get_and_inc();
-        self.scoped_locals_stack.push(ScopedLocal { name, id, mutable: false, span: None });
+        self.scoped_locals_stack.push(ScopedLocal {
+            name,
+            id,
+            kind: LocalKind::Immutable,
+            span: None,
+        });
         id
     }
 
@@ -224,17 +242,23 @@ impl BlockLowerer<'_> {
         self.create_sub_block_with(span, f).0
     }
 
+    fn create_unscoped_block<R>(
+        &mut self,
+        span: TokenSpan,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (BlockId, R) {
+        let block_start = self.instructions_buf.len();
+        let result = f(self);
+        let src_span = self.lexed.tokens_src_span(span);
+        (self.flush_instructions_from(block_start, src_span), result)
+    }
+
     fn create_sub_block_with<R>(
         &mut self,
         span: TokenSpan,
         f: impl FnOnce(&mut Self) -> R,
     ) -> (BlockId, R) {
-        let locals_start = self.scoped_locals_stack.len();
-        let block_start = self.instructions_buf.len();
-        let result = f(self);
-        self.scoped_locals_stack.truncate(locals_start);
-        let src_span = self.lexed.tokens_src_span(span);
-        (self.flush_instructions_from(block_start, src_span), result)
+        self.create_unscoped_block(span, |this| this.scoped(f))
     }
 
     fn lower_body_to_block(&mut self, block: ast::BlockExpr<'_>) -> BlockId {
@@ -413,7 +437,10 @@ impl BlockLowerer<'_> {
                                 expr,
                             });
                         });
-                        self.emit(InstructionKind::ComptimeBlock { body: block });
+                        self.emit(InstructionKind::ComptimeBlock {
+                            body: block,
+                            reason: ComptimeReason::Explicit,
+                        });
                     }
                     None => {
                         let expr = self.expr(ExprKind::VOID, struct_def.node().span());
@@ -454,7 +481,12 @@ impl BlockLowerer<'_> {
                     if_expr.else_if_branches(),
                     if_expr.else_body().ok_or_else(|| if_expr.body().node().span()),
                 );
-                self.emit(InstructionKind::If { condition, then_block, else_block });
+                self.emit(InstructionKind::If {
+                    outer_result: Some(result),
+                    condition,
+                    then_block,
+                    else_block,
+                });
                 ExprKind::LocalRef(result)
             }
             ast::Expr::ComptimeBlock(block) => {
@@ -473,7 +505,10 @@ impl BlockLowerer<'_> {
                     this.emit(InstructionKind::Set { local: result, r#type: None, expr });
                 });
 
-                self.emit(InstructionKind::ComptimeBlock { body });
+                self.emit(InstructionKind::ComptimeBlock {
+                    body,
+                    reason: ComptimeReason::Explicit,
+                });
                 ExprKind::LocalRef(result)
             }
             ast::Expr::Binary(binary) => 'binary: {
@@ -537,7 +572,7 @@ impl BlockLowerer<'_> {
     }
 
     fn add_param_to_scope_as_local(&mut self, param: ast::Param<'_>) -> LocalId {
-        self.alloc_local(param.name, false, param.name_span())
+        self.alloc_local(param.name, LocalKind::Immutable, param.name_span())
     }
 
     fn lower_fn_def(&mut self, fn_def: ast::FnDef<'_>) -> FnDefId {
@@ -562,7 +597,7 @@ impl BlockLowerer<'_> {
                             self.error_duplicate_param_any_type_capture(name, name_span, prev.span);
                             ParamType::Poisoned
                         } else {
-                            let capture = self.alloc_local(name, false, name_span);
+                            let capture = self.alloc_local(name, LocalKind::Immutable, name_span);
                             ParamType::Any { capture }
                         }
                     }
@@ -661,7 +696,12 @@ impl BlockLowerer<'_> {
                 let then_block = this.lower_branch_body(first.body(), result);
                 let else_body = else_body.map_err(|_| first.body().node().span());
                 let else_block = this.lower_else_chain(result, branches, else_body);
-                this.emit(InstructionKind::If { condition, then_block, else_block });
+                this.emit(InstructionKind::If {
+                    outer_result: None,
+                    condition,
+                    then_block,
+                    else_block,
+                });
             });
         }
         match else_body {
@@ -706,7 +746,12 @@ impl BlockLowerer<'_> {
             ShortCircuitOp::Or => (short_circuit_block, eval_op_rhs_block),
             ShortCircuitOp::And => (eval_op_rhs_block, short_circuit_block),
         };
-        let r#if = InstructionKind::If { condition: op_lhs_as_condition, then_block, else_block };
+        let r#if = InstructionKind::If {
+            outer_result: Some(op_result_local),
+            condition: op_lhs_as_condition,
+            then_block,
+            else_block,
+        };
         self.emit(r#if);
         ExprKind::LocalRef(op_result_local)
     }
@@ -714,16 +759,34 @@ impl BlockLowerer<'_> {
     fn lower_statement(&mut self, stmt: Statement<'_>) {
         match stmt {
             Statement::Let(let_stmt) => {
-                let expr = self.lower_expr(let_stmt.value());
-                // Local allocated *after* to ensure it's not visible to `lower_expr`.
-                let local = self.alloc_local(let_stmt.name, let_stmt.mutable, let_stmt.name_span);
-                let r#type =
-                    let_stmt.type_expr().map(|type_expr| self.lower_expr_to_local(type_expr));
-                self.emit(if let_stmt.mutable {
-                    InstructionKind::SetMut { local, r#type, expr }
+                let kind = match (let_stmt.mutable, let_stmt.comptime) {
+                    (true, false) => LocalKind::RuntimeMutable,
+                    (true, true) => LocalKind::ComptimeMutable,
+                    (false, _) => LocalKind::Immutable,
+                };
+                let value = let_stmt.value();
+                let lower_let = |this: &mut BlockLowerer<'_>| {
+                    let r#type =
+                        let_stmt.type_expr().map(|type_expr| this.lower_expr_to_local(type_expr));
+                    let expr = this.lower_expr(value);
+                    // Local allocated *after* to ensure it's not visible to `lower_expr`.
+                    let local = this.alloc_local(let_stmt.name, kind, let_stmt.name_span);
+                    this.emit(if let_stmt.mutable {
+                        InstructionKind::SetMut { comptime: let_stmt.comptime, local, r#type, expr }
+                    } else {
+                        InstructionKind::Set { local, r#type, expr }
+                    });
+                };
+
+                if let_stmt.comptime {
+                    let (body, ()) = self.create_unscoped_block(let_stmt.span, lower_let);
+                    self.emit(InstructionKind::ComptimeBlock {
+                        body,
+                        reason: ComptimeReason::LetInitializer,
+                    });
                 } else {
-                    InstructionKind::Set { local, r#type, expr }
-                });
+                    lower_let(self);
+                }
             }
             Statement::Expr(expr) => {
                 let value = self.lower_expr(expr);
@@ -746,7 +809,7 @@ impl BlockLowerer<'_> {
                     self.error_unresolved_identifier(name, span);
                     return;
                 };
-                if !entry.mutable {
+                if !entry.kind.mutable() {
                     self.error_assignment_to_immutable(
                         name,
                         span,
@@ -754,22 +817,33 @@ impl BlockLowerer<'_> {
                     );
                     return;
                 }
-                let target = entry.id;
-                let value = self.lower_expr(assign_stmt.value());
-                self.emit(InstructionKind::Assign { target, expr: value });
+                let lower_assign = |this: &mut BlockLowerer<'_>| {
+                    let target = entry.id;
+                    let value = this.lower_expr(assign_stmt.value());
+                    this.emit(InstructionKind::Assign { target, expr: value });
+                };
+                if let LocalKind::ComptimeMutable = entry.kind {
+                    let body = self.create_sub_block(assign_stmt.node().span(), lower_assign);
+                    self.emit(InstructionKind::ComptimeBlock {
+                        body,
+                        reason: ComptimeReason::Assign,
+                    })
+                } else {
+                    lower_assign(self);
+                }
             }
             Statement::While(while_stmt) => {
-                let span = while_stmt.node().span();
-                if while_stmt.inline {
-                    self.error_not_yet_implemented("inline while", span);
-                    return;
-                }
                 let (condition_block, condition) = self
                     .create_sub_block_with(while_stmt.condition().span(), |this| {
                         this.lower_expr_to_local(while_stmt.condition())
                     });
                 let body = self.lower_body_to_block(while_stmt.body());
-                self.emit(InstructionKind::While { condition_block, condition, body });
+                self.emit(InstructionKind::While {
+                    inline: while_stmt.inline,
+                    condition_block,
+                    condition,
+                    body,
+                });
             }
             Statement::Error { .. } => {}
         }

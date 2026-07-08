@@ -123,11 +123,12 @@ module.exports = grammar({
     _stmt: ($) => choice(
       seq(choice($._expr_no_block, $.return, $.assign, $.let), ";"),
       seq($.if_expr, optional(";")),
+      $.comptime_block,
       $.while
     ),
 
     while: ($) => seq(optional("inline"), "while", field("condition", $._expr), field("body", $.block)),
-    let: ($) => seq("let", optional("mut"), $.identifier, optional(seq(":", $._expr)), "=", $._expr),
+    let: ($) => seq(optional("comptime"), "let", optional("mut"), $.identifier, optional(seq(":", $._expr)), "=", $._expr),
     return: ($) => seq("return", $._expr),
     assign: ($) => seq($._expr, "=", $._expr),
 
