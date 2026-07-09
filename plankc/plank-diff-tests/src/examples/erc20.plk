@@ -95,7 +95,7 @@ const revert_4byte = fn (comptime selector: u256) never {
 const require_4byte = fn (condition: bool, comptime selector: u256) void {
     if !condition {
         revert_4byte(selector);
-    }
+    };
 };
 
 const calldataload_addr = fn (comptime offset: u256) addr {
@@ -230,7 +230,7 @@ const console = (struct { log: function }) {
         @mstore32(buf +% 32, value);
         if !@evm_staticcall(@evm_gas(), CONSOLE_ADDR, buf +% 28, 36, @malloc_uninit(0), 0) {
             @evm_revert(@malloc_uninit(0), 0);
-        }
+        };
     }
 };
 

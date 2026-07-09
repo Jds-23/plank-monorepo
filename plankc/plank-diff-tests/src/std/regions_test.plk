@@ -10,7 +10,7 @@ const TEST_BYTES_SHA256 = @sha256_cbytes(TEST_BYTES);
 const comptime_assert = fn (comptime condition: bool, comptime message: cbytes) void {
     if !condition {
         @compile_error(message);
-    }
+    };
 };
 
 init {
@@ -72,7 +72,7 @@ const public = fn (comptime signature: cbytes, comptime func: function) void {
     let target_selector = comptime { compute_selector(signature) };
     if selector == target_selector {
         func();
-    }
+    };
 };
 
 const calldata_bytes_arg = fn (comptime arg: u256) bytes(calldata) {
