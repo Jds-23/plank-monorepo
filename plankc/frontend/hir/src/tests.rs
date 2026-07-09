@@ -1748,3 +1748,113 @@ fn test_statement_if_without_else_is_legal() {
         "#,
     );
 }
+
+#[test]
+fn test_nested_statement_if_without_else_is_legal() {
+    assert_lowers_to(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            if cond {
+                if cond {
+                    @evm_sstore(1, 1);
+                }
+            };
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = @evm_calldataload(%0)
+        %2 = @evm_iszero(%1)
+        %4 = %2
+        if %4 {
+            %6 = %2
+            if %6 {
+                %7 = 1
+                %8 = 1
+                eval @evm_sstore(%7, %8)
+                %5 [br]= type:tuple {}
+            } else {
+                %5 [br]= type:tuple {}
+            }
+            %3 [br]= %5
+        } else {
+            %3 [br]= type:tuple {}
+        }
+        eval %3
+        eval @evm_stop()
+        "#,
+    );
+}
+
+#[test]
+fn test_statement_comptime_tail_if_without_else_is_legal() {
+    assert_lowers_to(
+        r#"
+        init {
+            comptime {
+                if @evm_iszero(0) {
+                    @evm_sstore(1, 1);
+                }
+            }
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        comptime {
+            %2 = 0
+            %3 = @evm_iszero(%2)
+            if %3 {
+                %4 = 1
+                %5 = 1
+                eval @evm_sstore(%4, %5)
+                %1 [br]= type:tuple {}
+            } else {
+                %1 [br]= type:tuple {}
+            }
+            %0 = %1
+        }
+        eval %0
+        eval @evm_stop()
+        "#,
+    );
+}
+
+#[test]
+fn test_init_body_tail_if_without_else_is_legal() {
+    assert_lowers_to(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            if cond {
+                @evm_sstore(1, 1);
+            }
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = @evm_calldataload(%0)
+        %2 = @evm_iszero(%1)
+        %4 = %2
+        if %4 {
+            %5 = 1
+            %6 = 1
+            eval @evm_sstore(%5, %6)
+            %3 [br]= type:tuple {}
+        } else {
+            %3 [br]= type:tuple {}
+        }
+        eval %3
+        "#,
+    );
+}
