@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
-use hashbrown::{HashMap, HashSet};
-use plank_core::{Idx, IncIterable, IndexVec, list_of_lists::ListOfLists};
+use hashbrown::HashMap;
+use plank_core::{DenseIndexSet, Idx, IncIterable, IndexVec, list_of_lists::ListOfLists};
 use plank_parser::{
     ast::{self, Statement, TopLevelDef},
     cst::{self, NodeIdx, NumLitId},
@@ -78,7 +78,7 @@ struct ScopedConst {
 
 struct BlockLowerer<'a> {
     consts: HashMap<StrId, ScopedConst>,
-    discarded_ifs: HashSet<NodeIdx>,
+    discarded_ifs: DenseIndexSet<NodeIdx>,
     num_lit_limbs: &'a ListOfLists<NumLitId, u32>,
     session: RefCell<&'a mut Session>,
 
@@ -279,7 +279,7 @@ impl BlockLowerer<'_> {
     fn mark_discarded_ifs(&mut self, expr: ast::Expr<'_>) {
         match expr {
             ast::Expr::If(if_expr) => {
-                self.discarded_ifs.insert(if_expr.node().idx());
+                self.discarded_ifs.add(if_expr.node().idx());
                 self.mark_discarded_block_tail(if_expr.body());
                 for branch in if_expr.else_if_branches().flatten() {
                     self.mark_discarded_block_tail(branch.body());
@@ -501,7 +501,7 @@ impl BlockLowerer<'_> {
             }
             ast::Expr::FnDef(fn_def) => ExprKind::FnDef(self.lower_fn_def(fn_def)),
             ast::Expr::If(if_expr) => {
-                let missing_else_allowed = self.discarded_ifs.contains(&if_expr.node().idx());
+                let missing_else_allowed = self.discarded_ifs.contains(if_expr.node().idx());
                 self.lower_if(if_expr, missing_else_allowed)
             }
             ast::Expr::ComptimeBlock(block) => {
@@ -589,16 +589,7 @@ impl BlockLowerer<'_> {
     fn lower_if(&mut self, if_expr: ast::IfExpr<'_>, missing_else_allowed: bool) -> ExprKind {
         let missing_else_error = !missing_else_allowed && if_expr.else_body().is_none();
         if missing_else_error {
-            // Can't use `if_expr.node().span()` here: the parser's else-lookahead skips
-            // trailing trivia, so the node's end extends past the last branch body.
-            let last_body = if_expr
-                .else_if_branches()
-                .filter_map(Result::ok)
-                .last()
-                .map_or(if_expr.body(), |branch| branch.body());
-            let chain_span =
-                TokenSpan::new(if_expr.node().span().start, last_body.node().span().end);
-            self.error_if_expr_missing_else(chain_span);
+            self.error_if_expr_missing_else(if_expr.node().span());
         }
         let result = self.alloc_temp();
         let condition = self.lower_expr_to_local(if_expr.condition());
@@ -911,7 +902,7 @@ pub fn lower(project: &ParsedProject, values: &mut ValueInterner, session: &mut 
 
     let mut lowerer = BlockLowerer {
         consts: HashMap::new(),
-        discarded_ifs: HashSet::new(),
+        discarded_ifs: DenseIndexSet::new(),
         num_lit_limbs: &project.parsed_sources[SourceId::ROOT].cst.num_lit_limbs,
         session: RefCell::new(session),
 
