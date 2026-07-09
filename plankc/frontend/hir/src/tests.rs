@@ -1939,7 +1939,7 @@ fn test_while_body_tail_if_without_else_is_legal() {
             test %3
             body:
                 %5 = %2
-                if %5 {
+                %4 <- if %5 {
                     %6 = 1
                     %7 = 1
                     eval @evm_sstore(%6, %7)
@@ -1972,7 +1972,7 @@ fn test_statement_if_with_non_void_tail_lowers() {
         %1 = @evm_calldataload(%0)
         %2 = @evm_iszero(%1)
         %4 = %2
-        if %4 {
+        %3 <- if %4 {
             %3 [br]= 1
         } else {
             %3 [br]= type:tuple {}
