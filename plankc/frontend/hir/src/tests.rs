@@ -1771,9 +1771,9 @@ fn test_nested_statement_if_without_else_is_legal() {
         %1 = @evm_calldataload(%0)
         %2 = @evm_iszero(%1)
         %4 = %2
-        if %4 {
+        %3 <- if %4 {
             %6 = %2
-            if %6 {
+            %5 <- if %6 {
                 %7 = 1
                 %8 = 1
                 eval @evm_sstore(%7, %8)
@@ -1811,7 +1811,7 @@ fn test_statement_comptime_tail_if_without_else_is_legal() {
         comptime {
             %2 = 0
             %3 = @evm_iszero(%2)
-            if %3 {
+            %1 <- if %3 {
                 %4 = 1
                 %5 = 1
                 eval @evm_sstore(%4, %5)
@@ -1846,7 +1846,7 @@ fn test_init_body_tail_if_without_else_is_legal() {
         %1 = @evm_calldataload(%0)
         %2 = @evm_iszero(%1)
         %4 = %2
-        if %4 {
+        %3 <- if %4 {
             %5 = 1
             %6 = 1
             eval @evm_sstore(%5, %6)
