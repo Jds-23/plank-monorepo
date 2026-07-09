@@ -1593,3 +1593,158 @@ fn test_return_outside_function_body() {
     );
     pretty_assertions::assert_str_eq!(actual_hir.trim(), expected_hir.trim());
 }
+
+#[test]
+fn test_if_expr_missing_else_in_let() {
+    let source = r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            let y = if cond { 1 } else if cond { 2 };
+            @evm_stop();
+        }
+    "#;
+
+    let (hir, big_nums, session, _project) = try_lower(source);
+
+    let diagnostics = format_session_diagnostics(&session);
+    let expected_diagnostics = dedent_preserve_blank_lines(
+        r#"
+        error: `if` used as an expression is missing an `else` branch
+         --> main.plk:3:13
+          |
+        3 |     let y = if cond { 1 } else if cond { 2 };
+          |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this `if` must produce a value on every path
+          |
+          = help: add an `else` branch that yields a value
+          = help: if the result is not used, terminate the `if` with `;`
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(diagnostics.trim(), expected_diagnostics.trim());
+
+    let actual_hir = format!("{}", DisplayHir::new(&hir, &big_nums, &session));
+    let expected_hir = dedent_preserve_blank_lines(
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = @evm_calldataload(%0)
+        %2 = @evm_iszero(%1)
+        %4 = %2
+        %3 <- if %4 {
+            %3 [br]= 1
+        } else {
+            %5 = %2
+            if %5 {
+                %3 [br]= 2
+            } else {
+                %3 [br]= <poison>
+            }
+        }
+        %6 = %3
+        eval @evm_stop()
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(actual_hir.trim(), expected_hir.trim());
+}
+
+#[test]
+fn test_if_expr_missing_else_in_fn_tail() {
+    let source = r#"
+        const f = fn (cond: bool) u256 {
+            if cond { 1 }
+        };
+        init {
+            @evm_stop();
+        }
+    "#;
+
+    let diagnostics = render_diagnostics(source);
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: `if` used as an expression is missing an `else` branch
+         --> main.plk:2:5
+          |
+        2 |     if cond { 1 }
+          |     ^^^^^^^^^^^^^ this `if` must produce a value on every path
+          |
+          = help: add an `else` branch that yields a value
+          = help: if the result is not used, terminate the `if` with `;`
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(diagnostics.trim(), expected.trim());
+}
+
+#[test]
+fn test_if_expr_missing_else_in_return() {
+    let source = r#"
+        const f = fn (cond: bool) u256 {
+            return if cond { 1 };
+        };
+        init {
+            @evm_stop();
+        }
+    "#;
+
+    let diagnostics = render_diagnostics(source);
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: `if` used as an expression is missing an `else` branch
+         --> main.plk:2:12
+          |
+        2 |     return if cond { 1 };
+          |            ^^^^^^^^^^^^^ this `if` must produce a value on every path
+          |
+          = help: add an `else` branch that yields a value
+          = help: if the result is not used, terminate the `if` with `;`
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(diagnostics.trim(), expected.trim());
+}
+
+#[test]
+fn test_statement_if_without_else_is_legal() {
+    assert_lowers_to(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            if cond {
+                @evm_sstore(1, 1);
+            }
+            if cond {
+                @evm_sstore(2, 2);
+            };
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = @evm_calldataload(%0)
+        %2 = @evm_iszero(%1)
+        %4 = %2
+        %3 <- if %4 {
+            %5 = 1
+            %6 = 1
+            eval @evm_sstore(%5, %6)
+            %3 [br]= type:tuple {}
+        } else {
+            %3 [br]= type:tuple {}
+        }
+        eval %3
+        %8 = %2
+        %7 <- if %8 {
+            %9 = 2
+            %10 = 2
+            eval @evm_sstore(%9, %10)
+            %7 [br]= type:tuple {}
+        } else {
+            %7 [br]= type:tuple {}
+        }
+        eval %7
+        eval @evm_stop()
+        "#,
+    );
+}
