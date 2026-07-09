@@ -1858,3 +1858,127 @@ fn test_init_body_tail_if_without_else_is_legal() {
         "#,
     );
 }
+
+#[test]
+fn test_if_expr_missing_else_inside_discarded_if_branch() {
+    let source = r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            if cond {
+                let y = if cond { 1 };
+            };
+            @evm_stop();
+        }
+    "#;
+
+    let diagnostics = render_diagnostics(source);
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: `if` used as an expression is missing an `else` branch
+         --> main.plk:4:17
+          |
+        4 |         let y = if cond { 1 };
+          |                 ^^^^^^^^^^^^^ this `if` must produce a value on every path
+          |
+          = help: add an `else` branch that yields a value
+          = help: if the result is not used, terminate the `if` with `;`
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(diagnostics.trim(), expected.trim());
+}
+
+#[test]
+fn test_if_expr_missing_else_in_call_argument() {
+    let source = r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            @evm_sstore(if cond { 1 }, 2);
+        }
+    "#;
+
+    let diagnostics = render_diagnostics(source);
+    let expected = dedent_preserve_blank_lines(
+        r#"
+        error: `if` used as an expression is missing an `else` branch
+         --> main.plk:3:17
+          |
+        3 |     @evm_sstore(if cond { 1 }, 2);
+          |                 ^^^^^^^^^^^^^ this `if` must produce a value on every path
+          |
+          = help: add an `else` branch that yields a value
+          = help: if the result is not used, terminate the `if` with `;`
+        "#,
+    );
+    pretty_assertions::assert_str_eq!(diagnostics.trim(), expected.trim());
+}
+
+#[test]
+fn test_while_body_tail_if_without_else_is_legal() {
+    assert_lowers_to(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            while cond {
+                if cond {
+                    @evm_sstore(1, 1);
+                }
+            }
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = @evm_calldataload(%0)
+        %2 = @evm_iszero(%1)
+        while {
+            cond:
+                %3 = %2
+            test %3
+            body:
+                %5 = %2
+                if %5 {
+                    %6 = 1
+                    %7 = 1
+                    eval @evm_sstore(%6, %7)
+                    %4 [br]= type:tuple {}
+                } else {
+                    %4 [br]= type:tuple {}
+                }
+                eval %4
+        }
+        eval @evm_stop()
+        "#,
+    );
+}
+
+#[test]
+fn test_statement_if_with_non_void_tail_lowers() {
+    assert_lowers_to(
+        r#"
+        init {
+            let cond = @evm_iszero(@evm_calldataload(0));
+            if cond { 1 };
+            @evm_stop();
+        }
+        "#,
+        r#"
+        ==== Constants ====
+
+        ==== Init ====
+        %0 = 0
+        %1 = @evm_calldataload(%0)
+        %2 = @evm_iszero(%1)
+        %4 = %2
+        if %4 {
+            %3 [br]= 1
+        } else {
+            %3 [br]= type:tuple {}
+        }
+        eval %3
+        eval @evm_stop()
+        "#,
+    );
+}
