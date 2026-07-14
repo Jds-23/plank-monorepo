@@ -255,7 +255,7 @@ impl BlockLowerer<'_> {
         Diagnostic::error("`if` used as an expression is missing an `else` branch")
             .primary(self.source_id, source_span, "this `if` must produce a value on every path")
             .help("add an `else` branch that yields a value")
-            .help("if the result is not used, terminate the `if` with `;`")
+            .help("if the value is not needed, add `;` to make this `if` a statement")
             .emit(*self.session.borrow_mut());
     }
 

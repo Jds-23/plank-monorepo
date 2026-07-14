@@ -1330,7 +1330,7 @@ fn test_comptime_only_then_branch_implicit_else() {
           |             ^^^^^^^^^^^^^^^^ this `if` must produce a value on every path
           |
           = help: add an `else` branch that yields a value
-          = help: if the result is not used, terminate the `if` with `;`
+          = help: if the value is not needed, add `;` to make this `if` a statement
         "#,
             r#"
         error: comptime-only value depends on runtime control flow

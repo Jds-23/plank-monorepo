@@ -1616,7 +1616,7 @@ fn test_if_expr_missing_else_in_let() {
           |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this `if` must produce a value on every path
           |
           = help: add an `else` branch that yields a value
-          = help: if the result is not used, terminate the `if` with `;`
+          = help: if the value is not needed, add `;` to make this `if` a statement
         "#,
     );
     pretty_assertions::assert_str_eq!(diagnostics.trim(), expected_diagnostics.trim());
@@ -1669,7 +1669,7 @@ fn test_if_expr_missing_else_in_fn_tail() {
           |     ^^^^^^^^^^^^^ this `if` must produce a value on every path
           |
           = help: add an `else` branch that yields a value
-          = help: if the result is not used, terminate the `if` with `;`
+          = help: if the value is not needed, add `;` to make this `if` a statement
         "#,
     );
     pretty_assertions::assert_str_eq!(diagnostics.trim(), expected.trim());
@@ -1696,7 +1696,7 @@ fn test_if_expr_missing_else_in_return() {
           |            ^^^^^^^^^^^^^ this `if` must produce a value on every path
           |
           = help: add an `else` branch that yields a value
-          = help: if the result is not used, terminate the `if` with `;`
+          = help: if the value is not needed, add `;` to make this `if` a statement
         "#,
     );
     pretty_assertions::assert_str_eq!(diagnostics.trim(), expected.trim());
@@ -1881,7 +1881,7 @@ fn test_if_expr_missing_else_inside_discarded_if_branch() {
           |                 ^^^^^^^^^^^^^ this `if` must produce a value on every path
           |
           = help: add an `else` branch that yields a value
-          = help: if the result is not used, terminate the `if` with `;`
+          = help: if the value is not needed, add `;` to make this `if` a statement
         "#,
     );
     pretty_assertions::assert_str_eq!(diagnostics.trim(), expected.trim());
@@ -1906,7 +1906,7 @@ fn test_if_expr_missing_else_in_call_argument() {
           |                 ^^^^^^^^^^^^^ this `if` must produce a value on every path
           |
           = help: add an `else` branch that yields a value
-          = help: if the result is not used, terminate the `if` with `;`
+          = help: if the value is not needed, add `;` to make this `if` a statement
         "#,
     );
     pretty_assertions::assert_str_eq!(diagnostics.trim(), expected.trim());
