@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 
 use hashbrown::HashMap;
-use plank_core::{DenseIndexSet, Idx, IncIterable, IndexVec, list_of_lists::ListOfLists};
+use plank_core::{Idx, IncIterable, IndexVec, list_of_lists::ListOfLists};
 use plank_parser::{
     ast::{self, Statement, TopLevelDef},
-    cst::{self, NodeIdx, NumLitId},
+    cst::{self, NumLitId},
     lexer::{Lexed, TokenSpan},
 };
 use plank_session::{Builtin, Poisoned, Session, SourceId, SourceSpan, StrId};
@@ -78,7 +78,6 @@ struct ScopedConst {
 
 struct BlockLowerer<'a> {
     consts: HashMap<StrId, ScopedConst>,
-    discarded_ifs: DenseIndexSet<NodeIdx>,
     num_lit_limbs: &'a ListOfLists<NumLitId, u32>,
     session: RefCell<&'a mut Session>,
 
@@ -112,7 +111,6 @@ impl BlockLowerer<'_> {
         const_defs: &IndexVec<ConstId, ConstDef>,
     ) {
         self.consts.clear();
-        self.discarded_ifs.clear();
         for &(name, const_id) in &source_consts[self.source_id] {
             let def = &const_defs[const_id];
             self.consts.insert(
@@ -269,36 +267,10 @@ impl BlockLowerer<'_> {
                 this.lower_statement(stmt);
             }
             if let Some(e) = block.end_expr() {
-                this.mark_discarded_ifs(e);
                 let value = this.lower_expr(e);
                 this.emit(InstructionKind::Eval(value));
             }
         })
-    }
-
-    fn mark_discarded_ifs(&mut self, expr: ast::Expr<'_>) {
-        match expr {
-            ast::Expr::If(if_expr) => {
-                self.discarded_ifs.add(if_expr.node().idx());
-                self.mark_discarded_block_tail(if_expr.body());
-                for branch in if_expr.else_if_branches().flatten() {
-                    self.mark_discarded_block_tail(branch.body());
-                }
-                if let Some(body) = if_expr.else_body() {
-                    self.mark_discarded_block_tail(body);
-                }
-            }
-            ast::Expr::Block(block) | ast::Expr::ComptimeBlock(block) => {
-                self.mark_discarded_block_tail(block);
-            }
-            _ => {}
-        }
-    }
-
-    fn mark_discarded_block_tail(&mut self, block: ast::BlockExpr<'_>) {
-        if let Some(expr) = block.end_expr() {
-            self.mark_discarded_ifs(expr);
-        }
     }
 
     fn lower_branch_body(&mut self, block: ast::BlockExpr<'_>, result: LocalId) -> BlockId {
@@ -501,8 +473,13 @@ impl BlockLowerer<'_> {
             }
             ast::Expr::FnDef(fn_def) => ExprKind::FnDef(self.lower_fn_def(fn_def)),
             ast::Expr::If(if_expr) => {
-                let missing_else_allowed = self.discarded_ifs.contains(if_expr.node().idx());
-                self.lower_if(if_expr, missing_else_allowed)
+                if if_expr.else_body().is_none() {
+                    self.emit_if_expr_missing_else(if_expr);
+                    self.lower_expr_to_local(if_expr.condition());
+                    ExprKind::POISON
+                } else {
+                    self.lower_if(if_expr)
+                }
             }
             ast::Expr::ComptimeBlock(block) => {
                 let result = self.alloc_temp();
@@ -586,11 +563,7 @@ impl BlockLowerer<'_> {
         self.expr(kind, expr.span())
     }
 
-    fn lower_if(&mut self, if_expr: ast::IfExpr<'_>, missing_else_allowed: bool) -> ExprKind {
-        let missing_else_error = !missing_else_allowed && if_expr.else_body().is_none();
-        if missing_else_error {
-            self.error_if_expr_missing_else(if_expr.node().span());
-        }
+    fn lower_if(&mut self, if_expr: ast::IfExpr<'_>) -> ExprKind {
         let result = self.alloc_temp();
         let condition = self.lower_expr_to_local(if_expr.condition());
         let then_block = self.lower_branch_body(if_expr.body(), result);
@@ -598,7 +571,6 @@ impl BlockLowerer<'_> {
             result,
             if_expr.else_if_branches(),
             if_expr.else_body().ok_or_else(|| if_expr.body().node().span()),
-            missing_else_error,
         );
         self.emit(InstructionKind::If {
             outer_result: Some(result),
@@ -726,7 +698,6 @@ impl BlockLowerer<'_> {
         result: LocalId,
         mut branches: impl Iterator<Item = Result<ast::ElseIfBranch<'cst>, TokenSpan>>,
         else_body: Result<ast::BlockExpr<'cst>, TokenSpan>,
-        missing_else_error: bool,
     ) -> BlockId {
         while let Some(next) = branches.next() {
             let Ok(first) = next else { continue };
@@ -734,8 +705,7 @@ impl BlockLowerer<'_> {
                 let condition = this.lower_expr_to_local(first.condition());
                 let then_block = this.lower_branch_body(first.body(), result);
                 let else_body = else_body.map_err(|_| first.body().node().span());
-                let else_block =
-                    this.lower_else_chain(result, branches, else_body, missing_else_error);
+                let else_block = this.lower_else_chain(result, branches, else_body);
                 this.emit(InstructionKind::If {
                     outer_result: None,
                     condition,
@@ -747,8 +717,7 @@ impl BlockLowerer<'_> {
         match else_body {
             Ok(body) => self.lower_branch_body(body, result),
             Err(empty_else_span) => self.create_sub_block(empty_else_span, |this| {
-                let kind = if missing_else_error { ExprKind::POISON } else { ExprKind::VOID };
-                let expr = this.expr(kind, empty_else_span);
+                let expr = this.expr(ExprKind::VOID, empty_else_span);
                 this.emit(InstructionKind::BranchSet { local: result, expr });
             }),
         }
@@ -829,8 +798,12 @@ impl BlockLowerer<'_> {
                     lower_let(self);
                 }
             }
+            Statement::Expr(ast::Expr::If(if_expr)) if if_expr.else_body().is_none() => {
+                let kind = self.lower_if(if_expr);
+                let value = self.expr(kind, if_expr.node().span());
+                self.emit(InstructionKind::Eval(value));
+            }
             Statement::Expr(expr) => {
-                self.mark_discarded_ifs(expr);
                 let value = self.lower_expr(expr);
                 self.emit(InstructionKind::Eval(value));
             }
@@ -902,7 +875,6 @@ pub fn lower(project: &ParsedProject, values: &mut ValueInterner, session: &mut 
 
     let mut lowerer = BlockLowerer {
         consts: HashMap::new(),
-        discarded_ifs: DenseIndexSet::new(),
         num_lit_limbs: &project.parsed_sources[SourceId::ROOT].cst.num_lit_limbs,
         session: RefCell::new(session),
 

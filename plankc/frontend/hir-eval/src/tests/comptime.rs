@@ -1321,8 +1321,7 @@ fn test_comptime_only_then_branch_implicit_else() {
             @evm_stop();
         }
         "#,
-        &[
-            r#"
+        &[r#"
         error: `if` used as an expression is missing an `else` branch
          --> main.plk:3:13
           |
@@ -1330,21 +1329,7 @@ fn test_comptime_only_then_branch_implicit_else() {
           |             ^^^^^^^^^^^^^^^^ this `if` must produce a value on every path
           |
           = help: add an `else` branch that yields a value
-          = help: if the value is not needed, add `;` to make this `if` a statement
-        "#,
-            r#"
-        error: comptime-only value depends on runtime control flow
-         --> main.plk:3:23
-          |
-        3 |     let T = if cond { u256 };
-          |                ----   ^^^^ comptime-only value
-          |                |
-          |                runtime condition here
-          |
-          = note: branches with runtime conditions must produce runtime-compatible values
-          = help: make the condition comptime-known to evaluate only the taken branch
-        "#,
-        ],
+        "#],
     );
 }
 

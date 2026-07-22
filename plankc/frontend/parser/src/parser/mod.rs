@@ -470,7 +470,6 @@ impl<'a> Parser<'a> {
         let if_body = self.parse_block(self.current_token_index(), NodeKind::Block);
         self.push_child(&mut conditional, if_body);
 
-        let mut chain_end = self.current_token_index();
         let mut else_ifs = self.alloc_node(NodeKind::ElseIfBranchList);
 
         let mut r#else = None;
@@ -482,7 +481,6 @@ impl<'a> Parser<'a> {
             if !self.eat(Token::If) {
                 let else_body = self.parse_block(self.current_token_index(), NodeKind::Block);
                 r#else = Some(else_body);
-                chain_end = self.current_token_index();
 
                 break;
             }
@@ -496,10 +494,9 @@ impl<'a> Parser<'a> {
 
             let else_if = self.close_node(else_if);
             self.push_child(&mut else_ifs, else_if);
-            chain_end = self.current_token_index();
         }
 
-        let else_ifs = self.close_node_at(else_ifs, chain_end);
+        let else_ifs = self.close_node(else_ifs);
         self.push_child(&mut conditional, else_ifs);
 
         if let Some(r#else) = r#else {
@@ -507,7 +504,7 @@ impl<'a> Parser<'a> {
             self.push_child(&mut conditional, r#else);
         }
 
-        Some(self.close_node_at(conditional, chain_end))
+        Some(self.close_node(conditional))
     }
 
     fn nth_child(&self, node: NodeIdx, i: usize) -> Option<NodeIdx> {

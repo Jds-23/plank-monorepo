@@ -1874,7 +1874,7 @@ fn test_struct_lit_in_parenthesized_if() {
                                 "\n    "
                             "}"
                         ElseIfBranchList
-                    "\n"
+                            "\n"
                 "}"
         "#,
     );
@@ -2688,7 +2688,7 @@ fn test_if_stmt_if_only() {
                                 " "
                             "}"
                         ElseIfBranchList
-                    " "
+                            " "
                 "}"
         "#,
     );
@@ -2748,7 +2748,7 @@ fn test_if_stmt_if_elseif() {
                                         ";"
                                         "\n    "
                                     "}"
-                    "\n"
+                            "\n"
                 "}"
         "#,
     );
