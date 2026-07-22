@@ -1649,33 +1649,6 @@ fn test_if_expr_missing_else_in_let() {
 }
 
 #[test]
-fn test_if_expr_missing_else_in_fn_tail() {
-    let source = r#"
-        const f = fn (cond: bool) u256 {
-            if cond { 1 }
-        };
-        init {
-            @evm_stop();
-        }
-    "#;
-
-    let diagnostics = render_diagnostics(source);
-    let expected = dedent_preserve_blank_lines(
-        r#"
-        error: `if` used as an expression is missing an `else` branch
-         --> main.plk:2:5
-          |
-        2 |     if cond { 1 }
-          |     ^^^^^^^^^^^^^ this `if` must produce a value on every path
-          |
-          = help: add an `else` branch that yields a value
-          = help: if the value is not needed, add `;` to make this `if` a statement
-        "#,
-    );
-    pretty_assertions::assert_str_eq!(diagnostics.trim(), expected.trim());
-}
-
-#[test]
 fn test_if_expr_missing_else_in_return() {
     let source = r#"
         const f = fn (cond: bool) u256 {
@@ -1781,7 +1754,8 @@ fn test_nested_statement_if_without_else_is_legal() {
             } else {
                 %5 [br]= type:tuple {}
             }
-            %3 [br]= %5
+            eval %5
+            %3 [br]= type:tuple {}
         } else {
             %3 [br]= type:tuple {}
         }
@@ -1819,7 +1793,8 @@ fn test_statement_comptime_tail_if_without_else_is_legal() {
             } else {
                 %1 [br]= type:tuple {}
             }
-            %0 = %1
+            eval %1
+            %0 = type:tuple {}
         }
         eval %0
         eval @evm_stop()

@@ -6,7 +6,7 @@ import std::math::ceil32;
 const assert_fits = fn (comptime T: type, buf: membytes, offset: u256, expected: bool) void {
     if abi_buf_fits(T, buf, offset) != expected {
         @evm_revert(@malloc_uninit(0), 0);
-    };
+    }
 };
 
 init {
